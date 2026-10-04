@@ -1,0 +1,237 @@
+// Auto-rotating display board for a projector. Reads the same snapshots as
+// /results, refreshed every two minutes rather than held on a live listener.
+import { el, backButton } from "../lib/ui.js";
+import { getOne, getAll } from "../lib/db.js";
+import { rankNode, hasMedal } from "../lib/ranks.js";
+import { rankIsPublic, isGroupClass, namesWithChest } from "../domain/constants.js";
+
+export default async function slideshowPage(root) {
+  const stage = el("div.slideshow");
+  root.appendChild(stage);
+  // This screen hides the app shell, so it needs its own way out.
+  root.appendChild(backButton());
+
+  let slides = [], index = 0, rankArt = {};
+  // Read once at load() and used when the timer starts below; clamped so a
+  // mistyped 0 cannot spin the projector at full speed.
+  let slideMs = 8000;
+
+  async function load() {
+    const [board, events] = await Promise.all([
+      getOne("publicLeaderboard", "main").catch(() => null),
+      getAll("publicResults").catch(() => [])
+    ]);
+
+    // I2 / I4 — the projector obeys the same public limits as /results.
+    const rankLimit = board?.rankLimit ?? 3;
+    const talentLimit = Number(board?.talentBoardLimit) || 10;
+    // I9 — was hard-coded to the last 12 events with no setting to change
+    // it; 0 means every published event, matching every other "0 = show
+    // all" limit in this app.
+    const recentLimit = board?.slideshowRecentLimit ?? 12;
+    rankArt = board?.rankArt || {};
+    const houseStyle = board?.houseStyle || {};
+    slideMs = Math.max(3, Number(board?.slideshowSeconds) || 8) * 1000;
+
+    // Which slides to build. Each defaults ON where it always showed, so a
+    // fest that never opens the new settings sees the slideshow it had.
+    const showHouses  = board?.slideshowShowHouses  ?? true;
+    const showTalent  = board?.slideshowShowTalent  ?? true;
+    const showResults = board?.slideshowShowResults ?? true;
+    const showCatBoards = !!board?.slideshowCategoryBoards;
+    const boardIds = Array.isArray(board?.slideshowBoardIds) ? board.slideshowBoardIds : [];
+
+    slides = [];
+    if (showHouses && board?.houses?.length) {
+      slides.push({
+        title: "House Rankings",
+        items: board.houses.slice(0, 10).map(h => ({
+          rank: h.rank, main: h.name, value: h.total + " pts",
+          crest: houseStyle[h.id]?.logoData || null,
+          color: houseStyle[h.id]?.color || null
+        }))
+      });
+    }
+    if (showTalent && board?.students?.length) {
+      slides.push({
+        title: "Student Talent",
+        items: board.students.slice(0, talentLimit || 10).map(s => ({
+          rank: s.rank, main: s.chestNumber ? `${s.name} #${s.chestNumber}` : s.name, sub: s.houseName, value: s.total + " pts",
+          photos: s.photo ? [s.photo] : []
+        }))
+      });
+    }
+    // I9 / v9.3 — one slide per category, independent of the combined board
+    // above rather than nested inside it. It used to require "Student
+    // Talent" to also be on, so a fest that wanted category slides ONLY —
+    // no combined "Total" slide — could turn this switch on and see
+    // nothing: the whole block was skipped whenever showTalent was off.
+    // Dense re-ranking within each category mirrors /results' own
+    // reRank(), so a slide never shows a rank that skips a place.
+    if (board?.students?.length && board.slideshowTalentByCategory) {
+      const byCat = new Map();
+      for (const s of board.students) {
+        const key = s.categoryName || "All categories";
+        if (!byCat.has(key)) byCat.set(key, []);
+        byCat.get(key).push(s);
+      }
+      for (const [catName, list] of byCat) {
+        const ranked = reRank(list).slice(0, talentLimit || 10);
+        slides.push({
+          // Matches the Big screen: the category leads, because it is what
+          // identifies the board to the room.
+          title: catName + " Student Talent",
+          items: ranked.map(s => ({
+            rank: s.rank, main: s.chestNumber ? `${s.name} #${s.chestNumber}` : s.name, sub: s.houseName, value: s.total + " pts",
+            photos: s.photo ? [s.photo] : []
+          }))
+        });
+      }
+    }
+    /* House points per category — one slide each. The same
+     * categoryBreakdown the public results page and the big screen already
+     * read, so a projector can never disagree with either. */
+    if (showCatBoards) {
+      const cb = board?.categoryBreakdown;
+      for (const col of (cb?.columns || [])) {
+        const rows = (cb.rows || [])
+          .map(r => ({ id: r.id, name: r.name, total: r.byCategory?.[col.id] || 0 }))
+          .filter(r => r.total > 0);
+        if (!rows.length) continue;
+        slides.push({
+          title: col.name,
+          sub: (board?.housePluralTerm || "Houses") + " · points in this category",
+          items: reRank(rows).map(r => ({
+            rank: r.rank, main: r.name, value: r.total + " pts",
+            crest: houseStyle[r.id]?.logoData || null,
+            color: houseStyle[r.id]?.color || null
+          }))
+        });
+      }
+    }
+
+    /* Custom leaderboards, whichever ones the Admin picked. Only boards
+     * already marked public reach the snapshot at all, so a staff-only
+     * board cannot be put on a projector by choosing it here. */
+    if (boardIds.length) {
+      for (const b of (board?.boards || [])) {
+        if (!boardIds.includes(b.id)) continue;
+        const rows = (b.rows || []).slice(0, b.rowLimit || 10);
+        if (!rows.length) continue;
+        slides.push({
+          title: b.name,
+          items: rows.map(r => ({
+            rank: r.rank, main: r.name, sub: r.houseName || "",
+            value: (r.total ?? 0) + " pts",
+            crest: houseStyle[r.id]?.logoData || null,
+            color: houseStyle[r.id]?.color || null
+          }))
+        });
+      }
+    }
+
+    // getAll() has no guaranteed order, and publishedAt is only the
+    // last-rebuild time (see domain/publish.js) — sort by the real publish
+    // moment so "recent" actually means recent, oldest-of-the-window first
+    // so the deck plays forward into the latest result.
+    const byPublishTime = [...events].sort((a, b) =>
+      (a.publishedAtMs || a.publishedAt || 0) - (b.publishedAtMs || b.publishedAt || 0));
+    const recent = showResults ? (recentLimit ? byPublishTime.slice(-recentLimit) : byPublishTime) : [];
+    for (const ev of recent) {
+      const top = (ev.entries || []).filter(e => !e.isAbsent && rankIsPublic(e.rank, rankLimit));
+      if (!top.length) continue;
+      slides.push({
+        title: ev.eventName,
+        sub: [ev.categoryName, ev.eventCode].filter(Boolean).join(" · "),
+        items: top.map(e => {
+          const est = houseStyle[e.houseId] || {};
+          return {
+            rank: e.rank,
+            // teamLabel is set to the house name even for an INDIVIDUAL
+            // event (domain/constants.js teamName()), so this must check
+            // isGroupClass before trusting it, or an individual winner's
+            // own name never shows.
+            main: (isGroupClass(ev.eventClass) && e.teamLabel) ? e.teamLabel : namesWithChest(e.names, e.chestNumbers),
+            sub: e.houseName,
+            crest: est.logoData || null,
+            color: est.useAsNameColor ? est.color : null,
+            // Only present when Settings → Public display → "Show
+            // participant photos beside published results" is on — see
+            // rebuildPublicSnapshots() in domain/publish.js, which is also
+            // what caps how many of these exist per event.
+            photos: Array.isArray(e.photos) ? e.photos.filter(Boolean) : []
+          };
+        })
+      });
+    }
+    if (!slides.length) slides = [{ title: "No results published yet", items: [] }];
+    if (index >= slides.length) index = 0;
+  }
+
+  function paint() {
+    const s = slides[index % slides.length];
+    stage.innerHTML = "";
+    stage.append(
+      el("h1", { text: s.title }),
+      s.sub ? el("div.slide-sub", { text: s.sub }) : null,
+      el("div", { style: "height:4px;width:80px;background:var(--marigold);margin:1rem 0 2rem" }),
+      ...s.items.map(it => el("div.item", {}, [
+        // I7 — medal artwork rather than "#1". On a hall projector a numeral
+        // reads as data; a medal reads as a result.
+        hasMedal(it.rank)
+          ? rankNode(it.rank, { size: 64, rankArt })
+          : el("span.item-rank", { text: "#" + it.rank }),
+        it.photos?.length
+          ? el("span.slide-photo-row", {}, it.photos.slice(0, 4).map((src, i) =>
+              el("img.slide-photo", {
+                src, alt: "", loading: "lazy",
+                style: i ? "margin-left:-36px" : null,
+                // A stale Drive link should read as "no photo", not as a
+                // broken-image icon on a screen an audience is watching.
+                onerror: e => e.target.remove()
+              })))
+          : null,
+        it.crest ? el("img.house-crest", { src: it.crest, alt: "" }) : null,
+        el("span.item-main", { text: it.main, style: it.color ? "color:" + it.color : null }),
+        it.sub ? el("span.item-sub", { text: it.sub }) : null,
+        it.value ? el("span.item-value", { text: it.value }) : null
+      ]))
+    );
+    index++;
+  }
+
+  await load();
+  paint();
+
+  /* Slide duration is a setting: a board of ten houses needs longer on
+   * screen than a single winner does, and only the fest knows which.
+   *
+   * The timer has to be REBUILT when that setting changes, not just read
+   * once at startup. setInterval fixes its period at the moment it is
+   * created, so the original code left a running projector stuck on
+   * whatever the duration was when the page was first opened — load()
+   * refreshes every two minutes and did update slideMs, but nothing acted
+   * on the new value. Since a projector is meant to run unattended all
+   * day, "change the setting and nothing happens" was the whole bug. */
+  let tick = setInterval(paint, slideMs);
+  let tickMs = slideMs;
+  const retime = () => {
+    if (slideMs === tickMs) return;
+    clearInterval(tick);
+    tick = setInterval(paint, slideMs);
+    tickMs = slideMs;
+  };
+
+  const refresh = setInterval(() => load().then(retime).catch(() => {}), 120000);
+  return () => { clearInterval(tick); clearInterval(refresh); };
+}
+
+// Dense ranking within one category — mirrors /results' own reRank(), so a
+// per-category slide never shows a rank that skips a place.
+function reRank(list) {
+  let rank = 0, prev = null;
+  return [...list].sort((a, b) => b.total - a.total).map(r => {
+    if (prev === null || r.total !== prev) { rank++; prev = r.total; }
+    return { ...r, rank };
+  });
+}

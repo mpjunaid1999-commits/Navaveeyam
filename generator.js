@@ -1,0 +1,1266 @@
+// Certificate & poster studio — a canvas editor with layers and properties.
+//
+// A design is data (see domain/templates.js), so the editor only ever
+// mutates plain numbers and strings. Saved designs live in
+// designs/{id} and are reused at generation time, which is why what you
+// arrange on screen is exactly what prints.
+import { el, card, field, input, select, button, toast, guard, notice, empty, badge, modal, confirmDialog, loading, checkbox, hint, photoPicker } from "../../lib/ui.js";
+import { getAll, getOne, put, patch, remove, where } from "../../lib/db.js";
+import { printDocument } from "../../lib/pdf.js";
+import { loadTemplate, TEMPLATE_LIST, TEMPLATE_KIND_LABEL, THEMES, PLACEHOLDERS, fillTokens } from "../../domain/templates.js";
+import { renderCanvas, renderPageHTML, previewData, ensureDesignFonts } from "../../lib/designRender.js";
+import { compressImage, photoSrc } from "../../lib/photo.js";
+import { PUBLISH_STATUS, classLabel, EVENT_CLASSES } from "../../domain/constants.js";
+import { highestRankAwarded, gradeLabel } from "../../domain/scoring.js";
+
+export default async function generator(root) {
+  const wrapper = el("div");
+  root.appendChild(wrapper);
+  let view = "list";
+  let design = null, designId = null;
+  // How many places this fest awards. Lives out here, not inside
+  // paintList(), because generateDialog() is a SIBLING of paintList and was
+  // reading it across a scope it could not see — a ReferenceError that threw
+  // on every single Generate click. paintList() is awaited before any
+  // Generate button exists, so this is always populated by the time one
+  // can be pressed.
+  let maxRank = 0;
+  /* Which style tab is open. Out here, not inside paintList(), because
+   * paintList() re-runs every time you come back from the editor — so a
+   * variable declared in there was re-initialised to the first theme and
+   * the chosen style was lost the moment you opened a template and closed
+   * it again. It should persist for the whole visit to this screen. */
+  let activeTheme = null;
+
+  await paintList();
+
+  /* ══ Design list ═══════════════════════════════════════════════ */
+  async function paintList() {
+    view = "list";
+    wrapper.innerHTML = "";
+    wrapper.appendChild(el("h1", { text: "Certificates & posters" }));
+    wrapper.appendChild(loading("Loading designs…"));
+
+    const [saved, results, types, tiers, categories] = await Promise.all([
+      getAll("designs").catch(() => []),
+      getAll("results").catch(() => []),
+      getAll("programTypes").catch(() => []),
+      getAll("programTiers").catch(() => []),
+      getAll("categories").catch(() => [])
+    ]);
+    const typeName = Object.fromEntries(types.map(t => [t.id, t.name]));
+    const tierName = Object.fromEntries(tiers.map(t => [t.id, t.name]));
+    const catName = Object.fromEntries(categories.map(c => [c.id, c.name]));
+    wrapper.innerHTML = "";
+    wrapper.appendChild(el("h1", { text: "Certificates & posters" }));
+
+    const published = results.filter(r => r.publishStatus === PUBLISH_STATUS.PUBLISHED);
+
+    // How many places this fest awards, from the widest rank ladder in use.
+    // Every ladder, not just the four class ones — a Type or Tier ladder
+    // may award more places than any class does.
+    const ladders = await getAll("pointsConfig").catch(() => []);
+    maxRank = highestRankAwarded(ladders);
+    if (!published.length) {
+      wrapper.appendChild(notice("warn",
+        "No results are published yet. You can design freely now, but generating uses published results only."));
+    }
+
+    /* One tab per theme, each showing that theme's eight grouped by kind.
+     * Stacking all three themes down the page put 24 buttons under six
+     * headings in one card — the themes are alternatives, not a list to
+     * read through, so only the chosen one belongs on screen. Same
+     * `.tabs` markup the public results page uses, so it behaves like
+     * every other tab strip in the app. */
+    const kindOrder = ["certificate", "poster", "idcard", "announce"];
+    const availableThemes = THEMES.filter(th => TEMPLATE_LIST.some(t => t.theme === th.id));
+    // Keep whatever was open; fall back to the first only on a first visit
+    // (or if a theme ever stops existing).
+    if (!availableThemes.some(th => th.id === activeTheme)) {
+      activeTheme = availableThemes[0]?.id;
+    }
+
+    const themeTabs = el("div.tabs");
+    const themePanel = el("div");
+    availableThemes.forEach(th => themeTabs.appendChild(button(th.label, {
+      class: th.id === activeTheme ? "active" : "",
+      onclick: () => { activeTheme = th.id; paintThemePanel(); }
+    })));
+
+    function paintThemePanel() {
+      themeTabs.querySelectorAll("button").forEach((b, i) =>
+        b.className = availableThemes[i].id === activeTheme ? "active" : "");
+      themePanel.innerHTML = "";
+      const th = availableThemes.find(x => x.id === activeTheme);
+      if (!th) return;
+      themePanel.appendChild(el("p.hint", { style: "margin:0 0 .7rem", text: th.blurb }));
+      for (const kind of kindOrder) {
+        const items = TEMPLATE_LIST.filter(t => t.theme === th.id && t.kind === kind);
+        if (!items.length) continue;
+        themePanel.appendChild(el("div", { style: "margin-bottom:.6rem" }, [
+          el("div.hint", { style: "margin:0 0 .25rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;font-size:.72rem",
+            text: TEMPLATE_KIND_LABEL[kind] || kind }),
+          el("div.chip-row", {}, items.map(t =>
+            el("button.chip", { type: "button", text: t.label, onclick: () => openEditor(loadTemplate(t.id), null) })))
+        ]));
+      }
+    }
+    paintThemePanel();
+
+    wrapper.appendChild(card(el("div", {}, [
+      el("p.hint", { text: "Start from a template, arrange it on the canvas, then generate for everyone at once. " +
+        "Each style carries the same eight pieces, so a fest can stay in one look throughout." }),
+      themeTabs,
+      themePanel
+    ]), "New design"));
+
+    wrapper.appendChild(card(
+      saved.length
+        ? el("div", {}, saved.map(d => el("div", {
+            style: "display:flex;gap:.7rem;align-items:center;padding:.55rem 0;border-bottom:1px solid var(--line)"
+          }, [
+            el("div", { style: "flex:1;min-width:0" }, [
+              el("strong", { text: d.name || "Untitled" }),
+              el("div.hint", { style: "margin:0", text:
+                `${d.page?.w}×${d.page?.h}mm · ${(d.elements || []).length} elements` })
+            ]),
+            d.isPublic ? badge("Public", "badge-ok") : null,
+            // v8 — sharing is per design, deliberately. There is no
+            // "publish all": each one is a decision.
+            button(d.isPublic ? "Unshare" : "Share publicly", { class: "btn-sm", onclick: guard(async () => {
+              await patch("designs", d.id, { isPublic: !d.isPublic });
+              toast(d.isPublic ? "No longer public." : "Now on the public templates page.");
+              paintList();
+            })}),
+            // One certificate on demand, found by chest number — for the
+            // person standing at the desk saying theirs did not print.
+            button("Print one", { class: "btn-sm",
+              onclick: () => singleDialog(normalise(d), published, typeName, tierName, catName) }),
+            button("Edit", { class: "btn-sm", onclick: () => openEditor(normalise(d), d.id) }),
+            // guard()ed because generateDialog is async and loads six
+            // collections before it can show anything. Unguarded, a failed
+            // read rejected into nowhere and the button just did nothing.
+            button("Generate", { class: "btn-sm btn-accent", onclick: guard(() => generateDialog(normalise(d))) }),
+            button("Delete", { class: "btn-sm btn-danger", onclick: guard(async () => {
+              if (!await confirmDialog("Delete design", `Delete "${d.name}"?`, "Delete")) return;
+              await remove("designs", d.id); toast("Deleted."); paintList();
+            })})
+          ])))
+        : empty("No saved designs yet", "Pick a template above to start."),
+      "Saved designs"));
+  }
+
+  function normalise(d) {
+    return {
+      name: d.name, page: d.page, background: d.background,
+      backgroundImage: d.backgroundImage || null,
+      elements: (d.elements || []).map(e => ({ ...e }))
+    };
+  }
+
+  /* ══ Editor ════════════════════════════════════════════════════ */
+  function openEditor(d, id) {
+    // Load the design typefaces before the canvas paints, so what the editor
+    // shows matches what the print window will produce.
+    ensureDesignFonts();
+    view = "editor";
+    design = d;
+    designId = id;
+    let selectedId = null;
+    let zoom = 0.42;
+
+    wrapper.innerHTML = "";
+
+    // B12 — the leave-editor warning fired unconditionally, even seconds
+    // after a successful Save, because nothing ever checked whether there
+    // WAS an unsaved change. A structural snapshot compares cheaply and
+    // needs no per-mutation bookkeeping across the dozen places this
+    // editor changes `design` (drag, resize, add/remove element, every
+    // property field).
+    let savedSnapshot = JSON.stringify(design);
+    const isDirty = () => JSON.stringify(design) !== savedSnapshot
+      || (nameInput.value.trim() || "Untitled") !== (design.name || "Untitled");
+
+    const nameInput = input({ value: design.name || "Untitled", style: "max-width:220px;min-height:36px" });
+    const header = el("div.card-head", {}, [
+      button("← Back", { class: "btn-sm", onclick: guard(async () => {
+        if (!isDirty() || await confirmDialog("Leave editor", "Unsaved changes will be lost. Save first?", "Leave without saving")) paintList();
+      })}),
+      nameInput,
+      el("div.spacer"),
+      button("−", { class: "btn-sm", onclick: () => { zoom = Math.max(0.2, zoom - 0.06); paintStage(); } }),
+      el("span.hint", { style: "margin:0;min-width:44px;text-align:center", text: Math.round(zoom * 100) + "%" }),
+      button("+", { class: "btn-sm", onclick: () => { zoom = Math.min(1.1, zoom + 0.06); paintStage(); } }),
+      button("Save design", { class: "btn-sm btn-primary", onclick: guard(saveDesign) }),
+      button("Generate", { class: "btn-sm btn-accent", onclick: guard(() => generateDialog(design)) })
+    ]);
+
+    const left = el("div.studio-pane.left");
+    const stage = el("div.studio-stage");
+    const right = el("div.studio-pane.right");
+    const studio = el("div.studio", {}, [left, stage, right]);
+
+    wrapper.append(el("h1", { text: "Design editor" }), header, studio);
+
+    /* ── Left pane: canvas settings + layers ────────────────────── */
+    function paintLeft() {
+      left.innerHTML = "";
+
+      left.appendChild(el("div.studio-title", { text: "Add element" }));
+      left.appendChild(el("div.btn-row", { style: "margin-bottom:.9rem" }, [
+        button("Text", { class: "btn-sm", onclick: () => addElement("text") }),
+        button("Box", { class: "btn-sm", onclick: () => addElement("box") }),
+        button("Image", { class: "btn-sm", onclick: () => addElement("image") })
+      ]));
+
+      left.appendChild(el("div.studio-title", { text: "Canvas" }));
+      const bgColor = el("input", { type: "color", value: design.background || "#ffffff",
+        style: "height:34px;padding:2px" });
+      bgColor.addEventListener("input", () => { design.background = bgColor.value; paintStage(); });
+      left.appendChild(field("Background colour", bgColor));
+
+      const bgFile = el("input", { type: "file", accept: "image/*", style: "display:none" });
+      bgFile.addEventListener("change", guard(async () => {
+        const f = bgFile.files?.[0];
+        if (!f) return;
+        design.backgroundImage = await compressImage(f, 1400, 0.8);
+        paintStage(); paintLeft();
+      }));
+      left.appendChild(el("div.btn-row", { style: "margin-bottom:.9rem" }, [
+        button("Upload background", { class: "btn-sm", onclick: () => bgFile.click() }),
+        design.backgroundImage ? button("Clear", { class: "btn-sm", onclick: () => {
+          design.backgroundImage = null; paintStage(); paintLeft();
+        }}) : null,
+        bgFile
+      ]));
+
+      const orient = select([
+        { value: "landscape", label: "Landscape" },
+        { value: "portrait", label: "Portrait" }
+      ], { value: design.page.w > design.page.h ? "landscape" : "portrait" });
+      orient.addEventListener("change", () => {
+        // Swap the design's OWN w/h rather than resetting to a hard-coded
+        // A4 size — a non-A4 design (the ID card is 85.6×54mm) would
+        // otherwise lose its real dimensions the moment anyone touched
+        // this control, even by re-selecting the orientation it was
+        // already in.
+        const wantLandscape = orient.value === "landscape";
+        if (wantLandscape !== (design.page.w > design.page.h)) {
+          design.page = { w: design.page.h, h: design.page.w };
+        }
+        paintStage();
+      });
+      left.appendChild(field("Orientation", orient));
+
+      left.appendChild(el("div.studio-title", { text: "Layers" }));
+      const list = el("div");
+      // Reversed so the topmost visual layer sits at the top of the list.
+      [...design.elements].reverse().forEach(e => {
+        const row = el("div.layer-row" + (e.id === selectedId ? ".active" : ""), {}, [
+          el("span.ltype", { text: e.type[0].toUpperCase() }),
+          el("span.lname", { text: e.id }),
+          button("↑", { class: "btn-sm", onclick: ev => { ev.stopPropagation(); moveLayer(e, +1); } }),
+          button("↓", { class: "btn-sm", onclick: ev => { ev.stopPropagation(); moveLayer(e, -1); } })
+        ]);
+        row.addEventListener("click", () => { selectedId = e.id; paintAll(); });
+        list.appendChild(row);
+      });
+      left.appendChild(list);
+    }
+
+    function moveLayer(e, dir) {
+      const i = design.elements.indexOf(e);
+      const j = i + dir;
+      if (j < 0 || j >= design.elements.length) return;
+      design.elements.splice(i, 1);
+      design.elements.splice(j, 0, e);
+      paintAll();
+    }
+
+    function addElement(type) {
+      const id = type + "_" + (design.elements.filter(x => x.type === type).length + 1);
+      const common = { id, type, x: 30, y: 30, w: type === "text" ? 120 : 40 };
+      const e = type === "text"
+        ? { ...common, text: "New text", size: 12, font: "sans", color: "#14232E", align: "left", weight: 400, lineHeight: 1.3 }
+        : type === "box"
+          ? { ...common, h: 20, fill: "#6C4BD6", stroke: "none", strokeWidth: 0, radius: 0 }
+          : { ...common, h: 40, src: "{photo}", radius: 0 };
+      design.elements.push(e);
+      selectedId = id;
+      paintAll();
+    }
+
+    /* ── Stage ──────────────────────────────────────────────────── */
+    function paintStage() {
+      stage.innerHTML = "";
+      stage.appendChild(renderCanvas(design, {
+        scale: zoom * 3.78,
+        selectedId,
+        onSelect: id => { selectedId = id; paintAll(); },
+        onChange: () => paintRight()
+      }));
+      const zoomLabel = header.querySelector(".hint");
+      if (zoomLabel) zoomLabel.textContent = Math.round(zoom * 100) + "%";
+    }
+
+    /* ── Right pane: properties ─────────────────────────────────── */
+    function paintRight() {
+      right.innerHTML = "";
+      right.appendChild(el("div.studio-title", { text: "Properties" }));
+
+      const e = design.elements.find(x => x.id === selectedId);
+      if (!e) {
+        right.appendChild(hint("Select an element on the canvas or in the layers list."));
+        return;
+      }
+
+      const num = (label, key, step = 1) => {
+        const i = input({ type: "number", step, value: e[key] ?? 0 });
+        i.addEventListener("input", () => { e[key] = Number(i.value) || 0; paintStage(); });
+        return field(label, i);
+      };
+
+      /**
+       * A colour property that can ALSO be "{houseColor}" — a live token,
+       * not a hex, resolved per person/entry at render time (see
+       * resolveColor() in designRender.js). An <input type=color> cannot
+       * represent that: handed a token string it silently shows some
+       * fallback, and the moment a designer nudges the swatch to see what
+       * colour it is, that literal hex overwrites the token and the house
+       * binding is gone without any deliberate choice to remove it.
+       *
+       * So the token is a distinct SOURCE, chosen from a select, not
+       * something the color input has to represent. Switching to "House
+       * colour" stores the literal token string in the property; switching
+       * away restores the last real hex, which is remembered even while
+       * the token is active so a designer can flip back and forth freely.
+       */
+      const colorField = (label, key, fallbackHex, { noneLabel } = {}) => {
+        const current = e[key];
+        const isToken = current === "{houseColor}";
+        const isNone = current === "none";
+        let lastHex = (!isToken && !isNone && current) || fallbackHex;
+
+        const picker = el("input", { type: "color", value: lastHex, style: "height:34px;padding:2px" });
+        const wrap = field(label, picker);
+        picker.style.display = isToken || isNone ? "none" : "";
+
+        const source = select([
+          { value: "custom", label: "Custom colour" },
+          { value: "house", label: "House colour (per person/entry)" }
+        ], { value: isToken ? "house" : "custom" });
+        source.addEventListener("change", () => {
+          if (source.value === "house") { e[key] = "{houseColor}"; picker.style.display = "none"; }
+          else { e[key] = isNone ? lastHex : (e[key] === "{houseColor}" ? lastHex : picker.value); picker.style.display = ""; }
+          paintStage();
+        });
+        wrap.insertBefore(source, picker);
+
+        picker.addEventListener("input", () => {
+          lastHex = picker.value;
+          if (source.value !== "house") e[key] = picker.value;
+          paintStage();
+        });
+
+        if (noneLabel) {
+          const noneBox = checkbox(noneLabel, isNone, v => {
+            if (v) { e[key] = "none"; }
+            else { e[key] = source.value === "house" ? "{houseColor}" : lastHex; }
+            picker.style.display = (v || source.value === "house") ? "none" : "";
+            source.disabled = v;
+            paintStage();
+          });
+          return el("div", {}, [wrap, noneBox]);
+        }
+        return wrap;
+      };
+
+      right.appendChild(el("div.btn-row", { style: "margin-bottom:.6rem" }, [
+        badge(e.type), el("span.spacer", { style: "flex:1" }),
+        button("Delete", { class: "btn-sm btn-danger", onclick: () => {
+          design.elements = design.elements.filter(x => x.id !== e.id);
+          selectedId = null; paintAll();
+        }})
+      ]));
+
+      right.appendChild(el("div.grid.grid-2", {}, [num("X (mm)", "x", 0.5), num("Y (mm)", "y", 0.5)]));
+      right.appendChild(el("div.grid.grid-2", {}, [
+        num("Width (mm)", "w", 0.5),
+        e.type !== "text" ? num("Height (mm)", "h", 0.5) : null
+      ]));
+
+      if (e.type === "text") {
+        const ta = el("textarea", { rows: 3, value: e.text || "" });
+        ta.addEventListener("input", () => { e.text = ta.value; paintStage(); });
+        right.appendChild(field("Text", ta));
+
+        right.appendChild(el("div.studio-title", { text: "Insert placeholder" }));
+        right.appendChild(el("div.chip-row", {}, PLACEHOLDERS
+          .filter(p => p.token !== "{photo}")
+          .map(p => el("button.chip", { type: "button", text: p.token, title: p.label, onclick: () => {
+            e.text = (e.text || "") + p.token; ta.value = e.text; paintStage();
+          }}))));
+
+        right.appendChild(num("Size (pt)", "size", 0.5));
+
+        const font = select([
+          { value: "sans", label: "Sans" }, { value: "serif", label: "Serif" },
+          { value: "display", label: "Display" }, { value: "mono", label: "Mono" }
+        ], { value: e.font || "sans" });
+        font.addEventListener("change", () => { e.font = font.value; paintStage(); });
+        right.appendChild(field("Font", font));
+
+        const weight = select([
+          { value: "400", label: "Regular" }, { value: "600", label: "Semibold" }, { value: "700", label: "Bold" }
+        ], { value: String(e.weight || 400) });
+        weight.addEventListener("change", () => { e.weight = Number(weight.value); paintStage(); });
+        right.appendChild(field("Weight", weight));
+
+        const align = select([
+          { value: "left", label: "Left" }, { value: "center", label: "Centre" }, { value: "right", label: "Right" }
+        ], { value: e.align || "left" });
+        align.addEventListener("change", () => { e.align = align.value; paintStage(); });
+        right.appendChild(field("Align", align));
+
+        right.appendChild(colorField("Colour", "color", "#14232E"));
+
+        right.appendChild(num("Line height", "lineHeight", 0.05));
+        right.appendChild(num("Letter spacing", "spacing", 0.5));
+        right.appendChild(checkbox("UPPERCASE", !!e.uppercase, v => { e.uppercase = v; paintStage(); }));
+      }
+
+      if (e.type === "box") {
+        right.appendChild(colorField("Fill", "fill", "#6C4BD6", { noneLabel: "No fill (outline only)" }));
+        right.appendChild(colorField("Border colour", "stroke", "#14232E", { noneLabel: "No border" }));
+        right.appendChild(num("Border width (mm)", "strokeWidth", 0.1));
+        right.appendChild(num("Corner radius (mm)", "radius", 0.5));
+        right.appendChild(num("Opacity (0–1)", "opacity", 0.05));
+      }
+
+      if (e.type === "image") {
+        const src = select([
+          { value: "{photo}", label: "Participant photo" },
+          { value: "custom", label: "Uploaded image" }
+        ], { value: e.src === "{photo}" ? "{photo}" : "custom" });
+        src.addEventListener("change", () => {
+          if (src.value === "{photo}") { e.src = "{photo}"; paintStage(); paintRight(); }
+        });
+        right.appendChild(field("Source", src));
+
+        const f = el("input", { type: "file", accept: "image/*" });
+        f.addEventListener("change", guard(async () => {
+          const file = f.files?.[0];
+          if (!file) return;
+          e.src = await compressImage(file, 800, 0.82);
+          paintStage(); paintRight();
+        }));
+        right.appendChild(field("Upload image", f));
+
+        /* A rank-holder's photo is the one element on a winner poster that
+         * people actually fiddle with, and it had only a corner radius —
+         * no way to make it a circle without working out the right radius by
+         * hand, no frame, no control over cropping. */
+        right.appendChild(el("div.studio-title", { text: "Shape" }));
+        right.appendChild(el("div.btn-row", {}, [
+          button("Square", { class: "btn-sm", onclick: () => { e.radius = 0; paintStage(); paintRight(); } }),
+          button("Rounded", { class: "btn-sm", onclick: () => {
+            e.radius = Math.max(1, Math.min(e.w, e.h || e.w) * 0.12);
+            paintStage(); paintRight();
+          }}),
+          // A circle is just a radius of half the shorter side — obvious once
+          // known, tedious to work out for every photo box by hand.
+          button("Circle", { class: "btn-sm", onclick: () => {
+            e.radius = Math.min(e.w, e.h || e.w) / 2;
+            paintStage(); paintRight();
+          }})
+        ]));
+        right.appendChild(num("Corner radius (mm)", "radius", 0.5));
+
+        const fit = select([
+          { value: "cover", label: "Fill the box (crops the photo)" },
+          { value: "contain", label: "Fit whole photo (may leave gaps)" }
+        ], { value: e.fit === "contain" ? "contain" : "cover" });
+        fit.addEventListener("change", () => { e.fit = fit.value; paintStage(); });
+        right.appendChild(field("Cropping", fit,
+          "Portraits are rarely the same shape as the box. “Fill” keeps the box full and trims the " +
+          "edges; “Fit” keeps the whole photo and leaves space around it."));
+
+        right.appendChild(colorField("Frame colour", "stroke", "#FFFFFF", { noneLabel: "No frame" }));
+        right.appendChild(num("Frame width (mm)", "strokeWidth", 0.1));
+        right.appendChild(num("Opacity (0–1)", "opacity", 0.05));
+      }
+    }
+
+    function paintAll() { paintLeft(); paintStage(); paintRight(); }
+
+    async function saveDesign() {
+      design.name = nameInput.value.trim() || "Untitled";
+      const id = designId || ("design_" + Date.now().toString(36));
+      await put("designs", id, {
+        name: design.name, page: design.page,
+        background: design.background, backgroundImage: design.backgroundImage || null,
+        elements: design.elements, updatedAt: Date.now()
+      }, false);
+      designId = id;
+      savedSnapshot = JSON.stringify(design);
+      toast("Design saved.");
+    }
+
+    paintAll();
+  }
+
+  /* ══ Generation ════════════════════════════════════════════════ */
+  async function generateDialog(d) {
+    // An announcement is written, not generated — it needs none of the
+    // roster, results or ladder reads below, and goes up before any of
+    // them exist.
+    if (isAnnouncement(d)) {
+      announceDialog(d, await getOne("config", "festSettings").catch(() => null));
+      return;
+    }
+    const [participants, houses, results, settings, categories, types, tiers] = await Promise.all([
+      getAll("participants"), getAll("houses"), getAll("results"),
+      getOne("config", "festSettings"), getAll("categories"),
+      getAll("programTypes").catch(() => []), getAll("programTiers").catch(() => [])
+    ]);
+    // B5 — Generate crashed for any fest with a published result: this
+    // dialog builds `typeName`/`tierName` lookups per event below, but the
+    // maps themselves were never fetched here (only paintList() had them).
+    const typeName = Object.fromEntries(types.map(t => [t.id, t.name]));
+    const tierName = Object.fromEntries(tiers.map(t => [t.id, t.name]));
+    const catName = Object.fromEntries(categories.map(c => [c.id, c.name]));
+    // Photos for the per-placement tokens on a results poster. Uploaded
+    // image first, then an external link — the same order the rest of the
+    // app resolves a portrait in, so a participant's face is the same
+    // picture whichever screen shows it.
+    const photoById = Object.fromEntries(participants
+      .map(p => [p.id, p.photoData || p.photoURL || null])
+      .filter(([, v]) => v));
+    // Same idea, for the {rankNhouseColor} tokens.
+    const houseColorById = Object.fromEntries(houses
+      .map(h => [h.id, h.color || null]).filter(([, v]) => v));
+    const published = results.filter(r => r.publishStatus === PUBLISH_STATUS.PUBLISHED);
+
+    /* B4 — THE CERTIFICATE POPULATION BUG.
+     *
+     * v7 built its list from PUBLISHED RESULTS ONLY:
+     *     participants.filter(p => byParticipant[p.id]?.length)
+     * Before a single event is published that set is empty, every
+     * participant is filtered out, and the run reports "No participants
+     * match" — which reads as the feature being broken. Participation
+     * certificates are exactly the thing you want to print BEFORE results.
+     *
+     * Generation now covers three populations, chosen at run time.
+     */
+    // These choose WHO is produced for, never WHAT is produced — the design
+    // you opened decides that. The labels used to end in "(participation
+    // certificates)" and "(posters)", which read as design types, so
+    // generating ID cards looked as though it had no option at all: the
+    // right answer was "Every registered participant" all along, wearing a
+    // certificate's name.
+    /* Only the audiences THIS design can actually produce for. The list used
+     * to offer all four for every design, so opening an ID card asked
+     * whether to print it for "winners only" — a question the design cannot
+     * answer, since it has no rank to show. Decided from the tokens the
+     * design actually uses rather than a saved kind, so it stays right for a
+     * design somebody built themselves. */
+    const modeOptions = audienceModesFor(d);
+    const mode = select(modeOptions, { value: modeOptions[0].value });
+    const houseSel = select([{ value: "", label: "All houses" },
+      ...houses.map(h => ({ value: h.id, label: h.name }))]);
+    const catSel = select([{ value: "", label: "All categories" },
+      ...categories.map(c => ({ value: c.id, label: c.name }))]);
+    const eventSel = select(
+      published.map(r => ({ value: r.id, label: r.eventName })),
+      {}
+    );
+    const eventField = field("Event", eventSel, "Only finalized, published events have results to show.");
+    eventField.style.display = "none";
+    if (!published.length) eventSel.disabled = true;
+
+    // Ranks come from the ladder, not a hard-coded 1..3 — a fest awarding a
+    // fourth place was silently cut off.
+    const rankBox = el("div.chip-row");
+    const picked = new Set();
+    for (let r = 1; r <= maxRank; r++) {
+      const b = el("button.chip", { type: "button", text: placeLabel(r), onclick: () => {
+        picked.has(r) ? picked.delete(r) : picked.add(r);
+        b.classList.toggle("on");
+      }});
+      rankBox.appendChild(b);
+    }
+    const rankField = field("Ranks to include", rankBox, "None selected means every placement.");
+    const batchSize = input({ type: "number", min: 1, value: 100 });
+    const houseField = field("House", houseSel);
+    const catField = field("Category", catSel);
+    const batchField = field("Pages per print window", batchSize,
+      "Large runs are split so the browser is never holding hundreds of pages at once.");
+
+    function syncMode() {
+      const isEventRanks = mode.value === "eventranks";
+      rankField.style.display = (mode.value === "registered" || isEventRanks) ? "none" : "";
+      houseField.style.display = isEventRanks ? "none" : "";
+      catField.style.display = isEventRanks ? "none" : "";
+      batchField.style.display = isEventRanks ? "none" : "";
+      eventField.style.display = isEventRanks ? "" : "none";
+    }
+    mode.addEventListener("change", syncMode);
+    // Run once on open. It never was, which was harmless only while the
+    // initial mode was always "registered"; now that a design picks its own
+    // starting audience, a results poster would open showing the house and
+    // category filters it does not use and hiding the event picker it needs.
+    syncMode();
+
+    modal({
+      title: "Generate — " + (d.name || "design"),
+      body: el("div", {}, [
+        el("p.hint", { text:
+          `Producing “${d.name || "this design"}” — one per person for whoever you choose below. ` +
+          `The design decides what is printed; this decides who gets one.` }),
+        // With a single possible audience there is no choice to present —
+        // a dropdown holding one item is a question with one answer.
+        modeOptions.length > 1 ? field("Who to produce for", mode) : null,
+        houseField,
+        catField,
+        rankField,
+        eventField,
+        batchField,
+        el("p.hint", { text: "Opens your browser's print window. Choose \"Save as PDF\" as the destination." })
+      ]),
+      actions: [
+        { label: "Cancel" },
+        { label: "Generate", kind: "accent", closes: false, busyLabel: "Building…", onClick: guard(async close => {
+            if (mode.value === "eventranks") {
+              const res = published.find(r => r.id === eventSel.value);
+              if (!res) { toast("Pick an event with published results.", true); return false; }
+              if (!printEventRanks(d, res, settings, catName, photoById, houseColorById)) {
+                toast("No ranked placements for that event.", true); return false;
+              }
+              close(true);
+              return;
+            }
+            const byParticipant = {};
+            for (const res of published) {
+              for (const e of res.entries || []) {
+                (e.participantIds || []).forEach(pid => {
+                  (byParticipant[pid] ||= []).push({
+                    eventName: res.eventName, eventClass: res.eventClass,
+                    categoryName: categories.find(c => c.id === res.categoryId)?.name || "",
+                    typeName: typeName[res.typeId] || "", tierName: tierName[res.tierId] || "",
+                    rank: e.rank, grade: e.grade ? gradeLabel(e.grade, settings) : e.grade, isAbsent: e.isAbsent
+                  });
+                });
+              }
+            }
+
+            const base = festBase(settings);
+            const pages = [];
+
+            const wantRank = r => !picked.size || picked.has(r);
+
+            if (mode.value === "registered" || mode.value === "participants") {
+              // "registered" does NOT require a published result — that was
+              // the whole defect.
+              let list = mode.value === "registered"
+                ? participants.slice()
+                : participants.filter(p => byParticipant[p.id]?.length);
+              if (houseSel.value) list = list.filter(p => p.houseId === houseSel.value);
+              if (catSel.value) list = list.filter(p => p.categoryId === catSel.value);
+              if (mode.value === "participants" && picked.size) {
+                list = list.filter(p => (byParticipant[p.id] || []).some(e => e.rank && wantRank(e.rank)));
+              }
+              if (!list.length) {
+                toast(mode.value === "registered"
+                  ? "No participants match those filters."
+                  : "No published results yet for anyone matching those filters. Try \u201cEvery registered participant\u201d.", true);
+                return false;
+              }
+
+              for (const p of list) {
+                const entries = byParticipant[p.id] || [];
+                const ph = houses.find(h => h.id === p.houseId);
+                pages.push(renderPageHTML(d, {
+                  ...base,
+                  name: p.name, chest: p.chestNumber ?? "",
+                  house: ph?.name || "", houseColor: ph?.color || "",
+                  category: p.categoryName || "", class: p.className || "",
+                  // A plain <img src> — same as the participant list, which
+                  // already displays this successfully — not a fetched data
+                  // URL. See waitForImages() in lib/pdf.js for why.
+                  photo: photoSrc(p),
+                  /* No single event is in scope for a participation
+                   * certificate. If every one of their results shares a
+                   * Type, that is unambiguous and worth printing; a mix
+                   * would be misleading, so it stays blank. */
+                  type: soleValue(entries.map(e => e.typeName)),
+                  tier: soleValue(entries.map(e => e.tierName)),
+                  results: entries.map(e =>
+                    `${e.eventName} — ${e.isAbsent ? "Absent" : (e.rank ? placeLabel(e.rank) : "Participated")}` +
+                    (e.grade && !e.isAbsent ? ` (${e.grade})` : "")).join("\n"),
+                  event: entries[0]?.eventName || "", rank: "", grade: "",
+                  // The best single placement across everything they entered
+                  // — a Bold Grid certificate leads with this as one giant
+                  // digit. Blank for someone with no placement at all,
+                  // same "no value, no fake zero" rule the rest of the app
+                  // follows.
+                  bestRank: bestRankOf(entries)
+                }));
+              }
+            } else {
+              const byId = Object.fromEntries(participants.map(p => [p.id, p]));
+              for (const res of published) {
+                for (const e of (res.entries || []).filter(x => !x.isAbsent && x.rank && wantRank(x.rank))) {
+                  for (const pid of e.participantIds || []) {
+                    const p = byId[pid];
+                    if (!p) continue;
+                    if (houseSel.value && p.houseId !== houseSel.value) continue;
+                    if (catSel.value && p.categoryId !== catSel.value) continue;
+                    pages.push(renderPageHTML(d, {
+                      ...base,
+                      name: p.name, chest: p.chestNumber ?? "",
+                      house: e.houseName || "",
+                      houseColor: houses.find(h => h.id === e.houseId)?.color || "",
+                      category: p.categoryName || "", class: p.className || "",
+                      photo: photoSrc(p),
+                      type: typeName[res.typeId] || "", tier: tierName[res.tierId] || "",
+                      event: res.eventName, rank: placeLabel(e.rank), grade: e.grade ? gradeLabel(e.grade, settings) : "",
+                      // The raw placement number, not the word — Bold Grid's
+                      // winner poster sets it as a single huge digit rather
+                      // than printing "FIRST" at that size.
+                      rankNum: e.rank,
+                      results: `${res.eventName} — ${placeLabel(e.rank)}`
+                    }));
+                  }
+                }
+              }
+              if (!pages.length) { toast("No winners match.", true); return false; }
+            }
+
+            /* BATCHING — a 600-page run with embedded photos joined into a
+             * single print document will stall or crash a modest laptop.
+             * Above the threshold it is split, and each batch opens as its
+             * own print window so the browser only ever holds one. */
+            const perBatch = Math.max(1, Number(batchSize.value) || 100);
+            const batches = [];
+            for (let i = 0; i < pages.length; i += perBatch) batches.push(pages.slice(i, i + perBatch));
+
+            const style = `<style>.design-page{position:relative;overflow:hidden;}
+                @page{size:${d.page.w}mm ${d.page.h}mm;margin:0;}
+                body{margin:0;}</style>`;
+
+            if (batches.length > 1) {
+              const ok = await confirmDialog("Print in batches",
+                `${pages.length} pages will be split into ${batches.length} print windows of up to ${perBatch}. ` +
+                `Save each one before moving to the next — your browser may block later windows otherwise.`,
+                "Start");
+              if (!ok) return false;
+            }
+
+            for (const [i, batch] of batches.entries()) {
+              printDocument({
+                title: (d.name || "Certificates") + (batches.length > 1 ? ` (${i + 1} of ${batches.length})` : ""),
+                subtitle: `${batch.length} pages`,
+                bodyHTML: style + batch.join(""),
+                landscape: d.page.w > d.page.h,
+                bare: true
+              });
+              // A beat between windows; browsers throttle rapid popups.
+              if (i < batches.length - 1) await new Promise(r => setTimeout(r, 700));
+            }
+            close(true);
+          })
+        }
+      ]
+    });
+  }
+}
+
+/**
+ * Rasterise one filled page and hand it to the browser as a PNG download —
+ * the "save as image" counterpart to printDocument()'s PDF path, for the
+ * two single-item flows (one certificate, one event poster) where a lone
+ * image file is actually useful. Bulk generation stays PDF-only: a batch
+ * run is already hundreds of pages, and a PNG per page has nowhere sane to
+ * go without a zip step this app doesn't carry.
+ */
+/**
+ * Fill in and print ONE announcement poster.
+ *
+ * Every other design in the app is generated — the data already exists and
+ * the only question is who to produce for. An announcement is the opposite:
+ * it goes up before the event, so nothing it shows has been recorded yet
+ * and all of it is typed. Hence a form rather than a filter, and one page
+ * rather than a batch.
+ */
+function announceDialog(design, settings) {
+  const base = festBase(settings);
+  const slots = guestSlotCount(design);
+  const inputs = {};
+
+  for (const f of ANNOUNCE_FIELDS) {
+    // Prefill from Settings where the fest already knows the answer, so the
+    // common case is confirming rather than typing.
+    const prefill = f.key === "title" ? base.fest
+      : f.key === "subtitle" ? base.subtitle
+      : f.key === "motto" ? base.motto : "";
+    inputs[f.key] = input({ value: prefill, placeholder: f.placeholder || "" });
+  }
+
+  const guestPickers = [];
+  for (let n = 1; n <= slots; n++) {
+    const nameI = input({ placeholder: "Name" });
+    const roleI = input({ placeholder: "Role" });
+    const pick = photoPicker({});
+    guestPickers.push({ n, nameI, roleI, pick });
+  }
+
+  const fieldsUsed = k => designUsesToken(design, new RegExp("\\{" + k + "\\}"));
+
+  modal({
+    title: "One poster — " + (design.name || "announcement"),
+    body: el("div", {}, [
+      el("p.hint", { text:
+        "An announcement goes up before the event, so there is nothing to generate it from — " +
+        "fill in what it should say. Anything left blank simply prints empty." }),
+      ...ANNOUNCE_FIELDS.filter(f => fieldsUsed(f.key))
+        .map(f => field(f.label, inputs[f.key], f.hint)),
+      slots
+        ? el("div", {}, [
+            el("div.hint", { style: "margin:.8rem 0 .3rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;font-size:.72rem",
+              text: `Guests (${slots} slot${slots === 1 ? "" : "s"})` }),
+            ...guestPickers.map(g => el("div", {
+              style: "display:flex;gap:.5rem;align-items:flex-start;padding:.4rem 0;border-top:1px solid var(--line)"
+            }, [
+              el("div", { style: "flex:0 0 auto" }, g.pick.node),
+              el("div", { style: "flex:1;min-width:0;display:flex;flex-direction:column;gap:.3rem" }, [g.nameI, g.roleI])
+            ]))
+          ])
+        : null
+    ]),
+    actions: [
+      { label: "Cancel" },
+      { label: "Print", kind: "accent", closes: false, busyLabel: "Building…", onClick: guard(async close => {
+          const data = collect();
+          const html = renderPageHTML(design, data);
+          printDocument({
+            title: data.title || "Announcement", bare: true,
+            landscape: design.page.w > design.page.h,
+            bodyHTML: `<style>.design-page{position:relative;overflow:hidden;}
+              @page{size:${design.page.w}mm ${design.page.h}mm;margin:0;}
+              body{margin:0;}</style>` + html
+          });
+          close(true);
+        })
+      }
+    ]
+  });
+
+  /* One place both actions read the form from, so Print and Save can never
+   * produce different posters from the same filled-in fields. */
+  function collect() {
+    const data = { ...base };
+    for (const f of ANNOUNCE_FIELDS) data[f.key] = inputs[f.key].value.trim();
+    if (!data.title) data.title = base.fest;
+    for (const g of guestPickers) {
+      data[`name${g.n}`] = g.nameI.value.trim();
+      data[`role${g.n}`] = g.roleI.value.trim();
+      const v = g.pick.getValue();
+      const src = v.photoData || v.photoURL || "";
+      if (src) data[`photo${g.n}`] = src;
+    }
+    return data;
+  }
+}
+
+/**
+ * The fest-level tokens every design gets, whatever it is producing.
+ *
+ * {subtitle} and {logo} come straight from Settings; {motto} has no field
+ * of its own yet, so it resolves blank and the one design that uses it
+ * (Announcement's ribbon-edge certificate) can simply have its own words
+ * typed into that element in the editor.
+ */
+function festBase(settings) {
+  return {
+    fest: settings?.festName || "",
+    school: settings?.schoolName || "",
+    subtitle: settings?.subtitle || "",
+    motto: settings?.motto || "",
+    logo: settings?.logoData || "",
+    date: new Date().toLocaleDateString()
+  };
+}
+
+/** The lowest (best) rank across a set of entries, or "" if none placed. */
+function bestRankOf(entries) {
+  const ranks = (entries || []).filter(e => e.rank && !e.isAbsent).map(e => e.rank);
+  return ranks.length ? Math.min(...ranks) : "";
+}
+
+function placeLabel(rank) {
+  return { 1: "First", 2: "Second", 3: "Third" }[rank] || (rank + "th");
+}
+
+/** True for a design built around {eventResults} — the "every rank on one
+ * page" poster/screen templates — rather than one participant's own data.
+ * Checked by content, not a saved `kind` field, so it still works for an
+ * older saved design that predates TEMPLATE_LIST carrying kind at all. */
+function usesEventResults(design) {
+  return designUsesToken(design, /\{(eventResults|rank\d+(name|house|photo|grade))\}/);
+}
+
+/** Every token the design references, across text bodies and image sources. */
+function designUsesToken(design, re) {
+  return (design.elements || []).some(e =>
+    (e.type === "text" && re.test(e.text || "")) ||
+    (e.type === "image" && re.test(e.src || "")));
+}
+
+/** The fields an announcement poster asks for, in the order they are shown. */
+const ANNOUNCE_FIELDS = [
+  { key: "title",       label: "Title",            hint: "Defaults to the fest name." },
+  { key: "subtitle",    label: "Subtitle",         placeholder: "Annual Fest" },
+  { key: "season",      label: "Season / edition", placeholder: "Season '26" },
+  { key: "motto",       label: "Motto",            placeholder: "Knowledge · Discipline · Service" },
+  { key: "when",        label: "Date and time",    placeholder: "14 February 2026 · 9:00 AM" },
+  { key: "venue",       label: "Venue",            placeholder: "School Ground" },
+  { key: "guestsLabel", label: "Heading over the guests", placeholder: "Chief Guests" }
+];
+
+/**
+ * True for a poster that is written rather than generated.
+ *
+ * An announcement goes up BEFORE the event, so there is no result, no
+ * placement and no registered participant to build it from — every one of
+ * these tokens is typed in. That makes it the one design in the kit with
+ * no "audience" at all: it produces exactly one page.
+ */
+function isAnnouncement(design) {
+  /* Deliberately NOT {subtitle} or {motto}: the fest already has a
+   * subtitle in Settings, and one certificate in this kit runs the school
+   * motto down its ribbon edge — both are ordinary fest data that any
+   * design may use, so treating either as an announcement signal turned a
+   * certificate into a one-off poster. */
+  return designUsesToken(design, /\{(title|when|venue|season|guestsLabel|name[1-4]|role[1-4]|photo[1-4])\}/);
+}
+
+/** How many guest slots the design actually has, so the form asks for no more. */
+function guestSlotCount(design) {
+  for (let n = 4; n >= 1; n--) {
+    const re = new RegExp("\\{(name|role|photo)" + n + "\\}");
+    if (designUsesToken(design, re)) return n;
+  }
+  return 0;
+}
+
+/**
+ * Which audiences make sense for one design.
+ *
+ * A design declares what it needs by the tokens it uses, so the question
+ * "who should this be produced for" has a different answer per design and
+ * asking the full list every time invites choosing one that cannot work:
+ *
+ *  · {eventResults} or {rankN…}  — the page IS one event, so the only
+ *    sensible run is "this one event", and the per-person options would
+ *    each produce the same page over and over.
+ *  · {rank} or {event}           — needs a placement, so it can only be
+ *    produced for people who have one. Offering "every registered
+ *    participant" here prints blank ranks for everyone who did not place.
+ *  · anything else               — participant-level only (an ID card, a
+ *    participation certificate), so everyone registered is fair game and is
+ *    the sensible default: it needs no published result at all.
+ */
+function audienceModesFor(design) {
+  // Checked first: an announcement also carries {photoN}, which the rankN
+  // test below would otherwise read as a results poster.
+  if (isAnnouncement(design)) {
+    return [{ value: "announce", label: "One poster — fill in the details" }];
+  }
+  if (usesEventResults(design)) {
+    return [{ value: "eventranks", label: "One event — every rank on one page" }];
+  }
+  if (designUsesToken(design, /\{(rank|event|grade)\}/)) {
+    return [
+      { value: "winners",      label: "Winners only — people who placed" },
+      { value: "participants", label: "Participants in published events" }
+    ];
+  }
+  return [
+    { value: "registered",   label: "Every registered participant" },
+    { value: "participants", label: "Participants in published events" },
+    { value: "winners",      label: "Winners only — people who placed" }
+  ];
+}
+
+/**
+ * Build the token data for the "every rank on one page" design for one
+ * event. Shared by the batch Generate flow, the single-event print, and
+ * single-event "save as image" below, so none of the three can drift into
+ * building the page differently. Returns null when the event has nothing
+ * ranked to show.
+ */
+function eventRanksData(design, res, settings, catName, photoById = {}, houseColorById = {}) {
+  const entries = (res.entries || []).filter(e => !e.isAbsent && e.rank);
+  if (!entries.length) return null;
+  const ordered = entries.slice().sort((a, b) => a.rank - b.rank);
+  const lines = ordered
+    .map(e => {
+      const who = (e.participantNames && e.participantNames.length > 1)
+        ? (e.houseName || "")
+        : [e.participantNames?.[0], e.houseName].filter(Boolean).join(" — ");
+      const gradeSuffix = e.grade ? ` (${gradeLabel(e.grade, settings)})` : "";
+      return `${placeLabel(e.rank)} — ${who}${gradeSuffix}`;
+    });
+
+  /* Per-placement tokens, so a poster can lay each winner out with a photo
+   * instead of listing them as text. Keyed by the ACTUAL rank, not by
+   * position in the list: with dense ranking two entries can share 1st and
+   * the next is 2nd, so the third row of the array is not "third place".
+   * A rank nobody holds simply has no tokens, and those elements render
+   * blank rather than showing someone else's name. */
+  const rankData = {};
+  for (const e of ordered) {
+    const n = e.rank;
+    const names = (e.participantNames || []).filter(Boolean);
+    // A group entry is the team, not a list of members — the same rule the
+    // text lines above already follow.
+    const who = names.length > 1 ? (e.houseName || names.join(", ")) : (names[0] || e.houseName || "");
+    if (rankData[`rank${n}name`] === undefined) {
+      rankData[`rank${n}name`] = who;
+      rankData[`rank${n}house`] = e.houseName || "";
+      rankData[`rank${n}houseColor`] = (e.houseId && houseColorById[e.houseId]) || "";
+      rankData[`rank${n}grade`] = e.grade ? gradeLabel(e.grade, settings) : "";
+      // The app has no timing/scoring unit finer than points, so Bold
+      // Grid's results table shows points where its own source design
+      // showed a race time — the nearest thing this fest actually tracks.
+      rankData[`rank${n}points`] = e.totalPoints ?? "";
+      // Only an individual entry has one face — or one chest number — to
+      // show; a team's would be an arbitrary member's, so both are left
+      // blank for a group placement.
+      const pid = names.length === 1 ? (e.participantIds || [])[0] : null;
+      if (pid && photoById[pid]) rankData[`rank${n}photo`] = photoById[pid];
+      if (names.length === 1) rankData[`rank${n}chest`] = (e.chestNumbers || [])[0] || "";
+    }
+  }
+
+  // How many points each house took from THIS event specifically — not the
+  // house's fest-wide total. A group entry's totalPoints already carries
+  // the house's share exactly once (see CLAUDE.md's group-points rule), so
+  // summing every entry's totalPoints per house is the whole computation.
+  const houseTotals = {};
+  for (const e of (res.entries || [])) {
+    if (!e.houseId) continue;
+    const h = (houseTotals[e.houseId] ??= { name: e.houseName || "", total: 0, color: houseColorById[e.houseId] || "" });
+    h.total += Number(e.totalPoints || 0);
+  }
+  const houseData = {};
+  Object.values(houseTotals)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 4)
+    .forEach((h, i) => {
+      houseData[`house${i + 1}name`] = h.name;
+      houseData[`house${i + 1}points`] = h.total;
+      houseData[`house${i + 1}color`] = h.color;
+    });
+
+  return {
+    ...festBase(settings),
+    // B25 — res.categoryName was never a field on a `results` document
+    // (only categoryId is); this always rendered blank regardless of
+    // which event was picked. Looked up from the categories the caller
+    // already has, same as everywhere else in this file.
+    event: res.eventName, category: catName?.[res.categoryId] || "",
+    eventResults: lines.join("\n"),
+    ...rankData,
+    ...houseData
+  };
+}
+
+/**
+ * Print the "every rank on one page" design for one event. Returns false
+ * when the event has nothing ranked to show.
+ */
+function printEventRanks(design, res, settings, catName, photoById = {}, houseColorById = {}) {
+  const data = eventRanksData(design, res, settings, catName, photoById, houseColorById);
+  if (!data) return false;
+  const html = renderPageHTML(design, data);
+  printDocument({
+    title: (design.name || "Event results") + " — " + res.eventName, bare: true,
+    landscape: design.page.w > design.page.h,
+    bodyHTML: `<style>.design-page{position:relative;overflow:hidden;}
+      @page{size:${design.page.w}mm ${design.page.h}mm;margin:0;}
+      body{margin:0;}</style>` + html
+  });
+  return true;
+}
+
+/**
+ * Print one participant's certificate, found by chest number or name —
+ * OR, for an "every rank on one page" design, print one EVENT's results,
+ * found by event code or name. The two designs need opposite search
+ * subjects (B24): a certificate is about a person, this poster is about
+ * an event, and searching participants for it would never find anything.
+ *
+ * The batch run is for producing everything at once; this is for the single
+ * person (or event) who needs it on its own. It prints REAL published
+ * results, unlike the public template gallery, because staff are asking on
+ * their behalf.
+ */
+function singleDialog(design, published, typeName, tierName, catName) {
+  // An announcement has no participant and no event to search for — "print
+  // one" and "generate" are the same act for it, so both land on the form.
+  if (isAnnouncement(design)) {
+    getOne("config", "festSettings").catch(() => null).then(s => announceDialog(design, s));
+    return;
+  }
+  if (usesEventResults(design)) { singleEventDialog(design, published, catName); return; }
+
+  const search = input({ placeholder: "Chest number or name", autocomplete: "off" });
+  const out = el("div");
+  let found = null;
+
+  const doSearch = guard(async () => {
+    out.innerHTML = "";
+    const term = search.value.trim().toLowerCase();
+    if (!term) return;
+    const [people, settings, houses, categories] = await Promise.all([
+      getAll("participants"), getOne("config", "festSettings"),
+      getAll("houses"), getAll("categories")
+    ]);
+    const matches = people.filter(p =>
+      String(p.chestNumber ?? "").toLowerCase() === term ||
+      String(p.name || "").toLowerCase().includes(term)).slice(0, 8);
+
+    if (!matches.length) { out.appendChild(notice("warn", "Nobody matches that.")); return; }
+
+    for (const p of matches) {
+      const entries = [];
+      for (const res of published) {
+        for (const e of res.entries || []) {
+          if ((e.participantIds || []).includes(p.id)) {
+            entries.push({ res, e });
+          }
+        }
+      }
+      out.appendChild(el("div", { style: "display:flex;gap:.6rem;align-items:center;padding:.45rem 0;border-top:1px solid var(--line)" }, [
+        el("div", { style: "flex:1;min-width:0" }, [
+          el("div", {}, [el("strong", { text: p.name }), " ",
+            el("span.mono", { text: String(p.chestNumber ?? "") })]),
+          el("div.hint", { style: "margin:0", text:
+            `${p.houseName || ""} · ${p.categoryName || ""} · ${entries.length} published result${entries.length === 1 ? "" : "s"}` })
+        ]),
+        (() => {
+          const base = festBase(settings);
+          const first = entries[0];
+          const tokenData = {
+            ...base,
+            name: p.name, chest: p.chestNumber ?? "",
+            house: houses.find(h => h.id === p.houseId)?.name || p.houseName || "",
+            houseColor: houses.find(h => h.id === p.houseId)?.color || "",
+            category: p.categoryName || "", class: p.className || "",
+            photo: photoSrc(p),
+            type: first ? (typeName[first.res.typeId] || "") : "",
+            tier: first ? (tierName[first.res.tierId] || "") : "",
+            event: first?.res.eventName || "",
+            rank: first?.e.rank ? placeLabel(first.e.rank) : "",
+            rankNum: first?.e.rank || "",
+            grade: first?.e.grade ? gradeLabel(first.e.grade, settings) : "",
+            results: entries.map(({ res, e }) =>
+              `${res.eventName} — ${e.isAbsent ? "Absent" : (e.rank ? placeLabel(e.rank) : "Participated")}` +
+              (e.grade && !e.isAbsent ? ` (${gradeLabel(e.grade, settings)})` : "")).join("\n"),
+            bestRank: bestRankOf(entries.map(({ e }) => e))
+          };
+          return el("div", { style: "display:flex;gap:.4rem" }, [
+            button("Print", { class: "btn-sm btn-accent", onclick: guard(async () => {
+              const html = renderPageHTML(design, tokenData);
+              printDocument({
+                title: p.name, bare: true, landscape: design.page.w > design.page.h,
+                bodyHTML: `<style>.design-page{position:relative;overflow:hidden;}
+                  @page{size:${design.page.w}mm ${design.page.h}mm;margin:0;}
+                  body{margin:0;}</style>` + html
+              });
+            })})
+          ]);
+        })()
+      ]));
+    }
+  });
+
+  search.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+
+  modal({
+    title: "Print one — " + (design.name || "design"),
+    body: el("div", {}, [
+      el("p.hint", { text: "Find a participant and print their certificate on its own. Uses their real published results." }),
+      field("Search", search),
+      el("div.btn-row", {}, button("Search", { onclick: doSearch })),
+      out
+    ]),
+    actions: [{ label: "Close" }]
+  });
+}
+
+/** The event-search counterpart to singleDialog(), for an "every rank on
+ * one page" design — B24. Searches published events by code or name
+ * instead of participants, since this design has no one participant to
+ * find. */
+function singleEventDialog(design, published, catName) {
+  const search = input({ placeholder: "Event code or name", autocomplete: "off" });
+  const out = el("div");
+
+  const doSearch = guard(async () => {
+    out.innerHTML = "";
+    const term = search.value.trim().toLowerCase();
+    if (!term) return;
+    // Participants come along for the ride so a results poster printed one
+    // at a time carries the same winner photos the batch run produces.
+    const [settings, people, houses] = await Promise.all([
+      getOne("config", "festSettings"),
+      getAll("participants").catch(() => []),
+      getAll("houses").catch(() => [])
+    ]);
+    const photoById = Object.fromEntries(people
+      .map(p => [p.id, p.photoData || p.photoURL || null])
+      .filter(([, v]) => v));
+    const houseColorById = Object.fromEntries(houses
+      .map(h => [h.id, h.color || null]).filter(([, v]) => v));
+    const matches = published.filter(r =>
+      String(r.eventCode ?? "").toLowerCase() === term ||
+      String(r.eventName || "").toLowerCase().includes(term)).slice(0, 8);
+
+    if (!matches.length) { out.appendChild(notice("warn", "No published event matches that.")); return; }
+
+    for (const res of matches) {
+      const rankedCount = (res.entries || []).filter(e => !e.isAbsent && e.rank).length;
+      out.appendChild(el("div", { style: "display:flex;gap:.6rem;align-items:center;padding:.45rem 0;border-top:1px solid var(--line)" }, [
+        el("div", { style: "flex:1;min-width:0" }, [
+          el("div", {}, [el("strong", { text: res.eventName }), " ",
+            el("span.mono", { text: res.eventCode || "" })]),
+          el("div.hint", { style: "margin:0", text: `${rankedCount} ranked placement${rankedCount === 1 ? "" : "s"}` })
+        ]),
+        button("Print", { class: "btn-sm btn-accent", onclick: () => {
+          if (!printEventRanks(design, res, settings, catName, photoById, houseColorById)) toast("No ranked placements for that event.", true);
+        }})
+      ]));
+    }
+  });
+
+  search.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+
+  modal({
+    title: "Print one — " + (design.name || "design"),
+    body: el("div", {}, [
+      el("p.hint", { text: "Find an event and print its results board on its own. Uses its real published results." }),
+      field("Search", search),
+      el("div.btn-row", {}, button("Search", { onclick: doSearch })),
+      out
+    ]),
+    actions: [{ label: "Close" }]
+  });
+}
+
+/** The one distinct non-empty value, or "" when there is more than one. */
+function soleValue(list) {
+  const set = new Set((list || []).filter(Boolean));
+  return set.size === 1 ? [...set][0] : "";
+}

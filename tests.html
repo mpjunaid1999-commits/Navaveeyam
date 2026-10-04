@@ -1,0 +1,1214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scoring tests</title>
+<link rel="stylesheet" href="./css/styles.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>Scoring tests</h1>
+  <p class="hint">Open this file in a browser after any change to the scoring rules. No Firebase connection is needed — these test pure logic only.</p>
+  <div id="out"></div>
+</div>
+
+<script type="module">
+import { gradeFor, denseRank, computeResults, finalizeBlockers, aggregate,
+         studentScore, rankLeaderboard, averageOf,
+         gradeScaleFrom, gradeLabel } from "./js/domain/scoring.js";
+import { nonRankHolders } from "./js/domain/reports.js";
+import { windowState, registrationWindow } from "./js/domain/registration.js";
+import { resolveCategory, byClass, byDob } from "./js/domain/autocategory.js";
+import { checkCaps, shortfalls, applyCounts, checkConstraints,
+         reservationBlocker } from "./js/domain/limits.js";
+import { resolvePoints, ladderKey, computeDirectResults, directFinalizeBlockers } from "./js/domain/scoring.js";
+import { limitsForCategory, counterKeys, maxFor, recountParticipant,
+         shortfalls as shortfallsV8 } from "./js/domain/limits.js";
+import { wallClockToEpoch, offsetMinutesAt, isValidZone } from "./js/lib/timezone.js";
+import { substitutionWindow, pendingCount } from "./js/domain/substitution.js";
+import { effectiveResultMode } from "./js/domain/constants.js";
+import { highestRankAwarded, boardMatchesEvent, tallyBoard, championshipStandings,
+         categoryBreakdown } from "./js/domain/scoring.js";
+import { overlaps, findClashes, describeClashes } from "./js/domain/clashes.js";
+import { codeLetterAt, entryCap, maxEntriesFor, minEntriesFor, entryCompletion,
+         rankCountFromLadder, publicRankLimit, rankIsPublic, GENDERS,
+         eventCategoryIds, eventAcceptsCategory, isMixedCategory,
+         eventCategoryLabel, eventFilterKeys, eventLabel,
+         entryCategoryOf, joinCategoryNames, eventCategoryExportLabel } from "./js/domain/constants.js";
+import { derivePattern, incrementLetters, nextChestValue, chestSortKey, compareChest,
+         matchesSeed, nextSeededValue, rangeClash, rangeOwner, overlappingRanges,
+         ownershipError, allocateChest, normalizeChest } from "./js/domain/chest.js";
+import { MM_PER_PX_AT_96DPI } from "./js/lib/designRender.js";
+import { shadeColor, darkenColor, lightenColor } from "./js/domain/houseColor.js";
+
+const out = document.getElementById("out");
+let pass = 0, fail = 0;
+
+function check(name, actual, expected) {
+  const a = JSON.stringify(actual), e = JSON.stringify(expected);
+  const ok = a === e;
+  ok ? pass++ : fail++;
+  const row = document.createElement("div");
+  row.className = "notice notice-" + (ok ? "ok" : "danger");
+  row.textContent = (ok ? "PASS  " : "FAIL  ") + name + (ok ? "" : `  — got ${a}, expected ${e}`);
+  out.appendChild(row);
+}
+
+const TH = { aMin: 85, bMin: 70, cMin: 50 };
+const GP = { A: 5, B: 3, C: 1, Without: 0 };
+const RP = { 1: 10, 2: 6, 3: 3 };
+
+/* Grades */
+check("90% is an A", gradeFor(90, TH), "A");
+check("85% is exactly an A", gradeFor(85, TH), "A");
+check("84.9% falls to B", gradeFor(84.9, TH), "B");
+check("50% is exactly a C", gradeFor(50, TH), "C");
+check("49% is Without", gradeFor(49, TH), "Without");
+check("0% is Without, not Absent", gradeFor(0, TH), "Without");
+
+/* Custom grade scales — v9 */
+const CUSTOM_SCALE = [
+  { id: "Aplus", label: "A+", minPercent: 95 },
+  { id: "A", label: "A", minPercent: 85 },
+  { id: "D", label: "D", minPercent: 40 }
+];
+check("gradeFor accepts a custom scale directly", gradeFor(97, CUSTOM_SCALE), "Aplus");
+check("a custom scale falls through to Without below its lowest rung",
+  gradeFor(30, CUSTOM_SCALE), "Without");
+check("gradeScaleFrom reads a saved custom scale, highest first",
+  gradeScaleFrom({ gradeScale: [{ id: "D", label: "D", minPercent: 40 }, { id: "Aplus", label: "A+", minPercent: 95 }] })
+    .map(g => g.id), ["Aplus", "D"]);
+check("gradeScaleFrom falls back to legacy aMin/bMin/cMin when no scale is saved",
+  gradeScaleFrom({ gradeThresholds: TH }).map(g => g.id), ["A", "B", "C"]);
+check("gradeScaleFrom falls back to the built-in default with neither",
+  gradeScaleFrom({}).map(g => g.id), ["A", "B", "C"]);
+check("gradeLabel renders a rename without touching the stored id",
+  gradeLabel("C", { gradeScale: [{ id: "C", label: "Satisfactory", minPercent: 50 }] }), "Satisfactory");
+check("gradeLabel falls back to the id itself for an unrecognised grade",
+  gradeLabel("Z", { gradeScale: [] }), "Z");
+check("gradeLabel honours a renamed Without", gradeLabel("Without", { withoutLabel: "Fail" }), "Fail");
+check("Absent is never treated as a configurable grade",
+  gradeLabel("Absent", { gradeScale: [{ id: "Absent", label: "should never win", minPercent: 0 }] }), "Absent");
+
+/* nonRankHolders' best-grade order — must follow the fest's own scale */
+check("best grade uses the custom order given, not an assumed A/B/C",
+  nonRankHolders(
+    [{ participantId: "p1", name: "X", rank: null, isAbsent: false, grade: "D", points: 1 },
+     { participantId: "p1", name: "X", rank: null, isAbsent: false, grade: "Aplus", points: 1 }],
+    { gradeOrder: ["Aplus", "A", "D", "Without"] }
+  )[0].bestGrade, "Aplus");
+check("a grade outside the given order does not crash and sorts last",
+  nonRankHolders(
+    [{ participantId: "p1", name: "X", rank: null, isAbsent: false, grade: "Mystery", points: 1 },
+     { participantId: "p1", name: "X", rank: null, isAbsent: false, grade: "A", points: 1 }],
+    { gradeOrder: ["A", "B", "C"] }
+  )[0].bestGrade, "A");
+
+/* Dense ranking */
+check("ties share a rank and the next score follows on",
+  denseRank([{ averageScore: 90 }, { averageScore: 90 }, { averageScore: 80 }]).map(r => r.rank),
+  [1, 1, 2]);
+check("distinct scores rank consecutively",
+  denseRank([{ averageScore: 70 }, { averageScore: 90 }, { averageScore: 80 }]).map(r => r.rank),
+  [1, 2, 3]);
+
+/* Averages */
+check("average of three judges", averageOf([80, 90, 100]), 90);
+check("no scores gives null, not zero", averageOf([]), null);
+
+/* Full computation */
+const entries = [
+  { regId: "a", houseId: "h1", participantIds: ["p1"], codeLetter: "A", scores: [90, 92], isAbsent: false },
+  { regId: "b", houseId: "h2", participantIds: ["p2"], codeLetter: "B", scores: [60, 62], isAbsent: false },
+  { regId: "c", houseId: "h1", participantIds: ["p3"], codeLetter: "C", scores: [30, 30], isAbsent: false },
+  { regId: "d", houseId: "h2", participantIds: ["p4"], codeLetter: "D", scores: [], isAbsent: true }
+];
+const res = computeResults(entries, { scoreScale: 100, thresholds: TH, rankPoints: RP, gradePoints: GP });
+const byCode = Object.fromEntries(res.map(r => [r.codeLetter, r]));
+
+check("winner gets rank points plus grade points", byCode.A.totalPoints, 15);
+check("second place grade C", byCode.B.grade, "C");
+check("second place totals rank 6 plus grade 1", byCode.B.totalPoints, 7);
+check("a low score is graded Without", byCode.C.grade, "Without");
+check("Without keeps its rank points", byCode.C.totalPoints, 3);
+check("Without scores zero grade points", byCode.C.gradePoints, 0);
+check("absent entry is graded Absent", byCode.D.grade, "Absent");
+check("absent entry scores nothing", byCode.D.totalPoints, 0);
+check("absent entry takes no rank", byCode.D.rank, null);
+check("absent entry does not consume a rank slot", byCode.C.rank, 3);
+
+/* Finalize guard */
+check("an entry with no score and no absence blocks finalize",
+  finalizeBlockers([{ regId: "x", codeLetter: "X", scores: [], isAbsent: false }]), ["X"]);
+check("an absent entry does not block finalize",
+  finalizeBlockers([{ regId: "x", codeLetter: "X", scores: [], isAbsent: true }]), []);
+
+/* House vs participant point rules */
+const events = [
+  { id: "e1", eventClass: "categoryIndividual" },
+  { id: "e2", eventClass: "categoryGroup" }
+];
+const results = [
+  { id: "e1", entries: [{ houseId: "h1", participantIds: ["p1"], totalPoints: 15 }] },
+  { id: "e2", entries: [{ houseId: "h1", participantIds: ["p1", "p2", "p3", "p4"], totalPoints: 15 }] }
+];
+const agg = aggregate(events, results, [{ id: "h1", adjustmentPoints: 0 }]);
+check("a four-member group win credits the house once, not four times",
+  agg.housePoints.h1, 30);
+check("each group member is credited the full entry points in their own pool",
+  agg.participants.p2.categoryGroupPoints, 15);
+check("individual points land in the individual pool",
+  agg.participants.p1.categoryIndividualPoints, 15);
+
+/* Events left out of totals — v9 */
+const exclAgg = aggregate(
+  [{ id: "e1", eventClass: "categoryIndividual" },
+   { id: "e2", eventClass: "categoryIndividual", excludeFromTotals: true }],
+  [{ id: "e1", entries: [{ houseId: "h1", participantIds: ["p1"], totalPoints: 15 }] },
+   { id: "e2", entries: [{ houseId: "h1", participantIds: ["p1"], totalPoints: 99 }] }],
+  [{ id: "h1", adjustmentPoints: 0 }]);
+check("an excluded event does not move the house total", exclAgg.housePoints.h1, 15);
+check("an excluded event does not move a participant pool",
+  exclAgg.participants.p1.categoryIndividualPoints, 15);
+check("an excluded event is left off a custom leaderboard",
+  tallyBoard({ scope: "all" },
+    [{ id: "e2", entries: [{ participantIds: ["p1"], participantNames: ["A"], totalPoints: 99 }] }],
+    { e2: { id: "e2", eventClass: "categoryIndividual", excludeFromTotals: true } }).length, 0);
+
+/* Registration extensions — v9 */
+(() => {
+  const PAST = Date.now() - 86400000;
+  const FUTURE = Date.now() + 86400000;
+  const closed = { registrationEnd: PAST };
+
+  check("an event past its deadline is closed",
+    windowState(closed, {}, Date.now(), "red").open, false);
+  check("an extension for that house reopens it",
+    windowState({ ...closed, registrationExtensions: { red: FUTURE } }, {}, Date.now(), "red").open, true);
+  check("another house is unaffected by it",
+    windowState({ ...closed, registrationExtensions: { red: FUTURE } }, {}, Date.now(), "blue").open, false);
+  check("__all reopens it for everybody",
+    windowState({ ...closed, registrationExtensions: { __all: FUTURE } }, {}, Date.now(), "blue").open, true);
+  check("an expired extension does not reopen anything",
+    windowState({ ...closed, registrationExtensions: { red: PAST } }, {}, Date.now(), "red").open, false);
+  check("an extension never pulls the deadline earlier",
+    registrationWindow({ registrationEnd: FUTURE, registrationExtensions: { red: PAST } }, {}, "red").end, FUTURE);
+  check("an extension cannot open registration before its start",
+    windowState({ registrationStart: FUTURE, registrationExtensions: { red: FUTURE } }, {}, Date.now(), "red").open, false);
+})();
+
+/* Constraint groups — v9 */
+(() => {
+  const EVENTS = {
+    e1: { id: "e1", typeId: "speech" },
+    e2: { id: "e2", typeId: "speech" },
+    e3: { id: "e3", typeId: "song" },
+    eng: { id: "eng", typeId: null }
+  };
+  // "One from: any Speech event, plus Speech English specifically."
+  const G = { name: "Speech group", maxEvents: 1, typeIds: ["speech"], eventIds: ["eng"] };
+  const chk = (ev, current) => checkConstraints(EVENTS[ev], [G], current, EVENTS);
+
+  check("an event outside the group is never blocked", chk("e3", ["e1", "eng"]), null);
+  check("the first event in the group is allowed", chk("e1", []), null);
+  check("a second event in the group is refused", !!chk("e2", ["e1"]), true);
+  check("membership by Type and by explicit id are both counted",
+    !!chk("eng", ["e1"]), true);
+  check("re-checking an event already entered does not count it twice",
+    chk("e1", ["e1"]), null);
+  check("a group with no max is inert", checkConstraints(EVENTS.e1, [{ typeIds: ["speech"] }], ["e2"], EVENTS), null);
+  check("a higher max allows more", checkConstraints(EVENTS.e2, [{ ...G, maxEvents: 2 }], ["e1"], EVENTS), null);
+})();
+
+/* Reserved slots in a general group event — v9 */
+(() => {
+  // 6 places; 2 must go to Subjuniors.
+  const EV = { reservedSlots: { sub: 2 } };
+  const R = (taken, categoryId) => reservationBlocker({ event: EV, categoryId, taken, capacity: 6 });
+
+  check("an early entry from any category is fine", R({}, "sen"), null);
+  check("a reserved category is never blocked by its own reservation",
+    R({ sen: 3, sub: 0 }, "sub"), null);
+  check("the last places are held back for an unfilled reservation",
+    !!R({ sen: 4, sub: 0 }, "sen"), true);
+  check("once the reservation is met the places are open to anyone",
+    R({ sen: 3, sub: 2 }, "sen"), null);
+  check("an event with no reservations never blocks",
+    reservationBlocker({ event: {}, categoryId: "sen", taken: { sen: 5 }, capacity: 6 }), null);
+  check("the ordinary capacity cap is left to handle a full event",
+    reservationBlocker({ event: EV, categoryId: "sen", taken: { sen: 6 }, capacity: 6 }), null);
+})();
+
+/* Automatic category assignment — v9 */
+(() => {
+  const CATS = [
+    { id: "sub", name: "Sub-Junior", classFrom: 1, classTo: 3, dobFrom: "2015-01-01", dobTo: "2018-12-31" },
+    { id: "jun", name: "Junior",     classFrom: 4, classTo: 7, dobFrom: "2011-01-01", dobTo: "2014-12-31" },
+    { id: "sen", name: "Senior",     classFrom: 8, classTo: 12, dobFrom: "2005-01-01", dobTo: "2010-12-31" }
+  ];
+  const R = o => resolveCategory({ categories: CATS, ...o });
+
+  check("off by default, nothing is derived", R({ cls: "5", dob: "2012-06-01" }).source, "manual");
+  check("class alone resolves", R({ mode: "class", cls: "5" }).categoryId, "jun");
+  check("date of birth alone resolves", R({ mode: "dob", dob: "2016-03-02" }).categoryId, "sub");
+  check("a class range is inclusive at both ends",
+    [R({ mode: "class", cls: "4" }).categoryId, R({ mode: "class", cls: "7" }).categoryId], ["jun", "jun"]);
+  check("a dob range is inclusive at both ends",
+    [R({ mode: "dob", dob: "2011-01-01" }).categoryId, R({ mode: "dob", dob: "2014-12-31" }).categoryId],
+    ["jun", "jun"]);
+  check("a class written as 'Class 5' still parses", R({ mode: "class", cls: "Class 5" }).categoryId, "jun");
+  check("nothing matching returns null rather than guessing",
+    R({ mode: "both", cls: "99", dob: "1990-01-01" }).categoryId, null);
+
+  // Agreement and clash.
+  check("both agreeing reports no clash",
+    R({ mode: "both", cls: "5", dob: "2012-06-01" }).clash, false);
+  const clash = R({ mode: "both", cls: "5", dob: "2016-06-01" });  // Junior by class, Sub-Junior by age
+  check("both disagreeing is flagged as a clash", clash.clash, true);
+  check("date of birth wins a clash by default", clash.categoryId, "sub");
+  check("class wins a clash when configured to",
+    R({ mode: "both", cls: "5", dob: "2016-06-01", winner: "class" }).categoryId, "jun");
+  check("a clash names both sides so the override is visible",
+    /Junior/.test(clash.reason) && /Sub-Junior/.test(clash.reason), true);
+  check("with only one rule on, the other cannot cause a clash",
+    R({ mode: "class", cls: "5", dob: "2016-06-01" }).clash, false);
+})();
+
+/* Manual adjustments — v9 */
+(() => {
+  const events = [{ id: "e1", eventClass: "categoryIndividual" }];
+  const results = [{ id: "e1", entries: [{ houseId: "red", participantIds: ["p1"], totalPoints: 10 }] }];
+  const houses = [{ id: "red", name: "Red", adjustmentPoints: 0 }];
+
+  const houseAdj = aggregate(events, results, houses,
+    [{ scope: "house", targetId: "red", points: -4 }]);
+  check("a house adjustment moves the house total", houseAdj.housePoints.red, 6);
+
+  const partAdj = aggregate(events, results, houses,
+    [{ scope: "participant", targetId: "p1", houseId: "red", points: -3 }]);
+  check("a participant adjustment lands in their own pool",
+    partAdj.participants.p1.adjustmentPoints, -3);
+  check("a participant adjustment also moves their house",
+    partAdj.housePoints.red, 7);
+
+  check("a zero adjustment is ignored rather than stored as noise",
+    aggregate(events, results, houses, [{ scope: "house", targetId: "red", points: 0 }]).housePoints.red, 10);
+
+  check("the legacy adjustmentPoints field still counts",
+    aggregate(events, results, [{ id: "red", name: "Red", adjustmentPoints: 5 }], []).housePoints.red, 15);
+
+  check("adjustments count in the student score regardless of pool toggles",
+    studentScore({ categoryIndividualPoints: 10, adjustmentPoints: -3 }, {}), 7);
+})();
+
+/* Category breakdown — v9 */
+(() => {
+  const events = [
+    { id: "e1", eventClass: "categoryIndividual", categoryId: "jun" },
+    { id: "e2", eventClass: "categoryIndividual", categoryId: "sen" },
+    { id: "e3", eventClass: "generalGroup", categoryId: null },
+    { id: "e4", eventClass: "categoryIndividual", categoryId: "jun", excludeFromTotals: true }
+  ];
+  const results = [
+    { id: "e1", entries: [{ houseId: "red", totalPoints: 10 }, { houseId: "blue", totalPoints: 4 }] },
+    { id: "e2", entries: [{ houseId: "red", totalPoints: 3 }, { houseId: "blue", totalPoints: 8 }] },
+    { id: "e3", entries: [{ houseId: "red", totalPoints: 5 }] },
+    { id: "e4", entries: [{ houseId: "red", totalPoints: 99 }] }
+  ];
+  const houses = [{ id: "red", name: "Red" }, { id: "blue", name: "Blue" }];
+  const cats = [{ id: "jun", name: "Junior" }, { id: "sen", name: "Senior" }];
+  const out = categoryBreakdown(events, results, houses, cats);
+  const red = out.rows.find(r => r.id === "red");
+  const blue = out.rows.find(r => r.id === "blue");
+
+  check("category points are tallied per house", red.byCategory.jun, 10);
+  check("general events land in their own bucket, not a category", red.byCategory.__general, 5);
+  check("an excluded event is left out of the breakdown too", red.total, 18);
+  check("the per-category totals reconcile with the house total",
+    red.byCategory.jun + red.byCategory.sen + red.byCategory.__general, red.total);
+  check("the category leader is the top scorer in that column alone",
+    out.leaders.sen.houseId, "blue");
+  check("a house can lead one category without leading overall",
+    [out.leaders.jun.houseId, out.rows[0].id], ["red", "red"]);
+  check("blue trails overall despite winning Senior", blue.total, 12);
+})();
+
+
+/* ══ Mixed-category events ═══════════════════════════════════════════
+ * One event open to several categories at once. It stays ONE event with
+ * ONE combined ranking; what changes is that every downstream question
+ * ("which category do these points belong to?", "could this house have
+ * won it?") must consider ALL its categories, not just the first.
+ */
+(() => {
+  const mixed  = { id: "m1", eventClass: "categoryIndividual", categoryId: "jun", categoryIds: ["jun", "sen"] };
+  const single = { id: "s1", eventClass: "categoryIndividual", categoryId: "jun" };
+  const general = { id: "g1", eventClass: "generalGroup", categoryId: null };
+  const catName = { jun: "Junior", sen: "Senior", kid: "Kids" };
+
+  check("a mixed event names every category it is open to",
+    eventCategoryIds(mixed), ["jun", "sen"]);
+  check("a single-category event is not mixed", isMixedCategory(single), false);
+  check("two or more categories makes it mixed", isMixedCategory(mixed), true);
+
+  check("two categories read as a sentence", joinCategoryNames(["Junior", "Senior"]), "Junior and Senior");
+  check("three categories use commas and a final and",
+    joinCategoryNames(["Kids", "Junior", "Senior"]), "Kids, Junior and Senior");
+  check("a mixed event is labelled with every category",
+    eventCategoryLabel(mixed, catName), "Junior and Senior");
+  check("a single-category event keeps its plain label",
+    eventCategoryLabel(single, catName), "Junior");
+
+  // An entry belongs to the category its own participant is in.
+  check("a Senior in a mixed event counts as Senior, not the event's first category",
+    entryCategoryOf(mixed, { entryCategoryId: "sen" }), "sen");
+  check("a Junior in the same mixed event counts as Junior",
+    entryCategoryOf(mixed, { entryCategoryId: "jun" }), "jun");
+  check("an older entry with no recorded category falls back to the event's",
+    entryCategoryOf(mixed, {}), "jun");
+  check("an ordinary event ignores the entry and uses its own category",
+    entryCategoryOf(single, { entryCategoryId: "sen" }), "jun");
+  check("a general event has no category at all", entryCategoryOf(general, { entryCategoryId: "sen" }), null);
+})();
+
+(() => {
+  /* The bug this fixes: a Junior+Senior event's points all landed in the
+   * Junior column, because the event was keyed by its first category. */
+  const events = [
+    { id: "m1", eventClass: "categoryIndividual", categoryId: "jun", categoryIds: ["jun", "sen"] }
+  ];
+  const results = [{ id: "m1", entries: [
+    { houseId: "red", totalPoints: 10, entryCategoryId: "jun" },
+    { houseId: "red", totalPoints: 8,  entryCategoryId: "sen" },
+    { houseId: "blue", totalPoints: 6, entryCategoryId: "sen" }
+  ]}];
+  const houses = [{ id: "red", name: "Red" }, { id: "blue", name: "Blue" }];
+  const cats = [{ id: "jun", name: "Junior" }, { id: "sen", name: "Senior" }];
+  const out = categoryBreakdown(events, results, houses, cats);
+  const red = out.rows.find(r => r.id === "red");
+
+  check("a mixed event's points split by each entry's own category",
+    [red.byCategory.jun, red.byCategory.sen], [10, 8]);
+  check("a mixed event's points still reconcile with the house total",
+    red.byCategory.jun + red.byCategory.sen, red.total);
+  check("no points are counted twice across the categories", red.total, 18);
+  check("the Senior column names the right leader",
+    out.leaders.sen.houseId, "red");
+})();
+
+(() => {
+  /* Championship denominator: a Senior-only house can genuinely win a
+   * Junior+Senior event, so it must count towards what that house could
+   * have earned. */
+  const events = [
+    { id: "m1", eventClass: "categoryIndividual", categoryId: "jun", categoryIds: ["jun", "sen"] }
+  ];
+  const ladders = { categoryIndividual: { rankPoints: { 1: 10 } } };
+  const participants = [
+    { id: "p1", houseId: "seniorHouse", categoryId: "sen" },
+    { id: "p2", houseId: "juniorHouse", categoryId: "jun" }
+  ];
+  const houses = [{ id: "seniorHouse", name: "S" }, { id: "juniorHouse", name: "J" }];
+  const out = championshipStandings({
+    events, ladders, participants, houses,
+    housePoints: { seniorHouse: 10, juniorHouse: 0 }, gradePoints: {}
+  });
+  const senior = out.find(r => r.id === "seniorHouse");
+  check("a Senior-only house counts a Junior+Senior event as earnable",
+    senior.maxEarnable, 10);
+  check("and so reaches 100% rather than being flattered by a smaller denominator",
+    senior.percent, 100);
+})();
+
+(() => {
+  /* A "Junior" custom board should include a Junior+Senior event. */
+  const mixed = { id: "m1", eventClass: "categoryIndividual", categoryId: "jun", categoryIds: ["jun", "sen"] };
+  check("a category board includes a mixed event that contains that category",
+    boardMatchesEvent({ categoryIds: ["sen"] }, mixed), true);
+  check("a category board still excludes a mixed event that does not",
+    boardMatchesEvent({ categoryIds: ["kid"] }, mixed), false);
+  check("an unfiltered board still takes everything",
+    boardMatchesEvent({}, mixed), true);
+})();
+
+check("a mixed event reads the one shared mixed ladder",
+  ladderKey("mixed", { categoryId: "jun", categoryIds: ["jun", "sen"] }), "mixed");
+check("a mixed-sourced event uses the mixed ladder, not its class",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "mixed" },
+    { categoryIndividual: { rankPoints: { 1: 5 } }, mixed: { rankPoints: { 1: 30, 2: 20 } } }, {}).rankPoints,
+  { 1: 30, 2: 20 });
+check("a mixed-sourced event with no mixed ladder falls back to its class",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "mixed" },
+    { categoryIndividual: { rankPoints: { 1: 5 } } }, {}).source,
+  "class");
+
+/* Championship by percentage — v9 */
+(() => {
+  const events = [
+    { id: "e1", eventClass: "categoryIndividual", categoryId: "sen", pointsFrom: "class" },
+    { id: "e2", eventClass: "categoryIndividual", categoryId: "sub", pointsFrom: "class" },
+    { id: "e3", eventClass: "generalIndividual", categoryId: null, pointsFrom: "class" }
+  ];
+  const houses = [{ id: "red", name: "Red" }, { id: "blue", name: "Blue" }];
+  // Red fields Seniors only; Blue fields both Seniors and Subjuniors.
+  const participants = [
+    { houseId: "red", categoryId: "sen" },
+    { houseId: "blue", categoryId: "sen" },
+    { houseId: "blue", categoryId: "sub" }
+  ];
+  const ladders = {
+    categoryIndividual: { rankPoints: { 1: 10 } },
+    generalIndividual: { rankPoints: { 1: 5 } }
+  };
+  // Blue outscores Red in raw points (15 vs 10) but is eligible for more —
+  // by percentage Red should come out ahead despite fewer raw points.
+  const housePoints = { red: 10, blue: 15 };
+  const rows = championshipStandings({ events, houses, participants, housePoints, ladders, gradePoints: {} });
+  const byId = Object.fromEntries(rows.map(r => [r.id, r]));
+
+  check("Red is only eligible for events in categories it actually fields",
+    byId.red.maxEarnable, 15);   // e1 (10) + e3 (5); e2 (Subjunior) is out of reach
+  check("Blue is eligible for every category it fields plus every general event",
+    byId.blue.maxEarnable, 25);  // e1 + e2 + e3
+  check("percentage is earned ÷ max earnable, as a rounded percent",
+    byId.red.percent, Math.round((10 / 15) * 1000) / 10);
+  check("a house with fewer raw points can still rank first by percentage",
+    rows[0].id, "red");
+  check("the trailing house keeps its own correct percentage",
+    byId.blue.percent, Math.round((15 / 25) * 1000) / 10);
+})();
+
+/* Leaderboard */
+const pools = { categoryIndividualPoints: 15, categoryGroupPoints: 15, generalIndividualPoints: 0, generalGroupPoints: 0 };
+check("group points are excluded by default",
+  studentScore(pools, { includeCategoryGroupPoints: false }), 15);
+check("group points count once toggled on",
+  studentScore(pools, { includeCategoryGroupPoints: true }), 30);
+/* Manual tie resolution — v9 */
+check("a manual place settles a tie the pools cannot",
+  rankLeaderboard(
+    [{ id: "a", name: "A", total: 10, pools: {} }, { id: "b", name: "B", total: 10, pools: {} }],
+    [], { b: 1, a: 2 }
+  ).map(r => r.name), ["B", "A"]);
+check("a manual place also splits the rank",
+  rankLeaderboard(
+    [{ id: "a", name: "A", total: 10, pools: {} }, { id: "b", name: "B", total: 10, pools: {} }],
+    [], { b: 1, a: 2 }
+  ).map(r => r.rank), [1, 2]);
+check("with no manual place a tie still shares a rank as co-toppers",
+  rankLeaderboard(
+    [{ id: "a", name: "A", total: 10, pools: {} }, { id: "b", name: "B", total: 10, pools: {} }],
+    [], {}
+  ).map(r => r.rank), [1, 1]);
+check("a configured pool still wins over a stale manual place",
+  rankLeaderboard(
+    [{ id: "a", name: "A", total: 10, pools: { categoryGroupPoints: 9 } },
+     { id: "b", name: "B", total: 10, pools: { categoryGroupPoints: 1 } }],
+    ["categoryGroupPoints"], { b: 1, a: 2 }
+  ).map(r => r.name), ["A", "B"]);
+check("manual ordering never disturbs rows separated by total",
+  rankLeaderboard(
+    [{ id: "a", name: "A", total: 5, pools: {} }, { id: "b", name: "B", total: 10, pools: {} }],
+    [], { a: 1, b: 9 }
+  ).map(r => r.name), ["B", "A"]);
+
+check("a tie is broken by the first listed pool",
+  rankLeaderboard([
+    { name: "X", total: 10, pools: { categoryGroupPoints: 2 } },
+    { name: "Y", total: 10, pools: { categoryGroupPoints: 8 } }
+  ], ["categoryGroupPoints"]).map(r => r.name),
+  ["Y", "X"]);
+
+/* Caps */
+const LIM = {
+  overallMax: 3, overallMin: 2,
+  categoryIndividual: { splitByStage: true, onStageMax: 1, offStageMax: 2 },
+  categoryGroup: { max: null, min: 1 }
+};
+const ev = { eventClass: "categoryIndividual", stage: "onStage" };
+check("under the cap is allowed", checkCaps({ overall: 0 }, ev, LIM), null);
+check("at the stage cap is blocked",
+  checkCaps({ overall: 1, "categoryIndividual.onStage": 1 }, ev, LIM)?.includes("on-stage"), true);
+/* Roll-up counters are kept even with useRollupCaps OFF, and that is
+ * deliberate: if they were only counted while enabled, an Admin switching
+ * roll-ups on mid-fest would start from zero and let everyone already over
+ * the new cap straight through. Count always, cap conditionally. */
+check("registering increments the overall, class, stage and roll-up counters",
+  applyCounts({}, ev, LIM, +1),
+  { overall: 1, categoryIndividual: 1, "categoryIndividual.onStage": 1,
+    "rollup:individual": 1, "rollup:category": 1 });
+check("roll-up counters accrue even while roll-up caps are switched off",
+  maxFor("rollup:individual", LIM), null);
+check("a shortfall is reported against a configured minimum",
+  shortfalls({ overall: 1 }, LIM).map(s => s.key), ["overall", "categoryGroup"]);
+
+/* Code letters */
+check("code letters continue past Z", [codeLetterAt(0), codeLetterAt(25), codeLetterAt(26)], ["A", "Z", "AA"]);
+
+/* ══ v7 ══════════════════════════════════════════════════════════════ */
+
+/* Chest number patterns — I23 */
+check("a seed splits into prefix, letters and digits",
+  derivePattern("RED-A01"), { prefix: "RED-", letters: "A", digits: "01", width: 2 });
+check("a letters-only seed has no digit part",
+  derivePattern("AAA"), { prefix: "", letters: "AAA", digits: "", width: 0 });
+check("a seed with nothing to advance is rejected", derivePattern("---"), null);
+
+check("letters advance like an odometer with A as zero",
+  [incrementLetters("A"), incrementLetters("AZ"), incrementLetters("AAZ")], ["B", "BA", "ABA"]);
+check("all-Z widens", incrementLetters("ZZ"), "AAA");
+
+check("digits roll within their width", nextChestValue("RED-A01"), "RED-A02");
+check("overflowing digits carry into the letters and reset",
+  nextChestValue("RED-A99"), "RED-B01");
+check("a letters-only pattern just advances",
+  [nextChestValue("AAA"), nextChestValue("AAZ")], ["AAB", "ABA"]);
+check("a digits-only pattern widens rather than losing a place",
+  nextChestValue("099"), "100");
+
+check("a value matches its own family but not another prefix",
+  [matchesSeed("RED-A07", "RED-A01"), matchesSeed("BLU-A07", "RED-A01")], [true, false]);
+check("the next seeded value skips ones already taken",
+  nextSeededValue("RED-A01", new Set(["RED-A01", "RED-A02"])), "RED-A03");
+
+/* Natural sort — a plain string compare gets this wrong */
+check("chest numbers sort numerically, not lexically",
+  ["10", "9", "100"].sort(compareChest), ["9", "10", "100"]);
+check("mixed patterns sort by prefix then number",
+  ["RED-A10", "RED-A9", "BLU-A2"].sort(compareChest), ["BLU-A2", "RED-A9", "RED-A10"]);
+check("the sort key pads digit runs", chestSortKey("A9"), "A000000000009");
+
+/* Ranges — I26 / I28 */
+const HOUSES = [
+  { id: "r", name: "Red",  chestRangeStart: 100, chestRangeEnd: 199 },
+  { id: "b", name: "Blue", chestRangeStart: 200, chestRangeEnd: 299 }
+];
+check("a clashing range is refused",
+  !!rangeClash({ houseId: "g", start: 150, end: 250, houses: HOUSES }), true);
+check("a range that only touches the gap is allowed",
+  rangeClash({ houseId: "g", start: 300, end: 399, houses: HOUSES }), null);
+check("editing a house does not clash with itself",
+  rangeClash({ houseId: "r", start: 100, end: 199, houses: HOUSES }), null);
+check("a backwards range is refused",
+  !!rangeClash({ houseId: "g", start: 400, end: 300, houses: HOUSES }), true);
+check("existing overlaps are still reported", overlappingRanges([
+  { id: "x", name: "X", chestRangeStart: 100, chestRangeEnd: 199 },
+  { id: "y", name: "Y", chestRangeStart: 150, chestRangeEnd: 249 }
+]).length, 1);
+check("a number inside a range is owned by that house",
+  rangeOwner("150", HOUSES)?.name, "Red");
+
+const DIGIT_CFG = { chestFormat: "digits", chestAllocation: "houseRange" };
+check("a house may not take a number out of another house's range",
+  !!ownershipError({ value: "250", house: HOUSES[0], houses: HOUSES, settings: DIGIT_CFG }), true);
+check("a house may take a number inside its own range",
+  ownershipError({ value: "150", house: HOUSES[0], houses: HOUSES, settings: DIGIT_CFG }), null);
+check("ownership is not enforced when the fest uses one shared sequence",
+  ownershipError({ value: "250", house: HOUSES[0], houses: HOUSES,
+    settings: { chestFormat: "digits", chestAllocation: "mixed" } }), null);
+check("a seeded house may not use another house's pattern",
+  !!ownershipError({ value: "BLU-A05",
+    house: { id: "r", name: "Red", chestSeed: "RED-A01" },
+    houses: [{ id: "r", name: "Red", chestSeed: "RED-A01" }, { id: "b", name: "Blue", chestSeed: "BLU-A01" }],
+    settings: { chestFormat: "alphanumeric" } }), true);
+
+/* Allocation is pure — this is what makes a batched import possible */
+check("allocation takes the lowest free number in the house range",
+  allocateChest({ explicit: null, house: HOUSES[0], houses: HOUSES,
+    settings: DIGIT_CFG, taken: new Set(["100", "101"]), counter: 0 }).value, "102");
+check("allocation threads the counter instead of reading Firestore",
+  allocateChest({ explicit: null, house: { id: "g", name: "Green" }, houses: [],
+    settings: { chestFormat: "digits", chestAllocation: "mixed" },
+    taken: new Set(), counter: 40 }), { value: "41", counter: 41 });
+check("an explicit number already taken is refused", (() => {
+  try {
+    allocateChest({ explicit: "150", house: HOUSES[0], houses: HOUSES,
+      settings: DIGIT_CFG, taken: new Set(["150"]), counter: 0 });
+    return false;
+  } catch { return true; }
+})(), true);
+check("a letter value is refused when the fest is digits-only", (() => {
+  try {
+    allocateChest({ explicit: "A12", house: HOUSES[0], houses: HOUSES,
+      settings: DIGIT_CFG, taken: new Set(), counter: 0 });
+    return false;
+  } catch { return true; }
+})(), true);
+check("a seeded house with no seed asks rather than guessing", (() => {
+  try {
+    allocateChest({ explicit: null, house: { id: "r", name: "Red" }, houses: [],
+      settings: { chestFormat: "alphanumeric" }, taken: new Set(), counter: 0 });
+    return false;
+  } catch { return true; }
+})(), true);
+
+/* Entry caps — I12 / I31 */
+check("a blank maximum means unlimited",
+  [maxEntriesFor({}), maxEntriesFor({ maxEntriesPerHouse: null }),
+   maxEntriesFor({ maxEntriesPerHouse: "" })], [null, null, null]);
+check("zero also means unlimited", entryCap(0), null);
+check("a set maximum is read on every class",
+  ["categoryIndividual", "generalGroup"].map(c =>
+    maxEntriesFor({ eventClass: c, maxEntriesPerHouse: 2 })), [2, 2]);
+check("a blank minimum means no minimum", minEntriesFor({ minEntriesPerHouse: "" }), null);
+
+check("with no minimum set, one entry completes the event",
+  entryCompletion({}, 1, true).complete, true);
+check("with no entries and no minimum, the event is incomplete",
+  entryCompletion({}, 0, true).complete, false);
+check("a minimum of three needs three",
+  [entryCompletion({ minEntriesPerHouse: 3 }, 2, true).complete,
+   entryCompletion({ minEntriesPerHouse: 3 }, 3, true).complete], [false, true]);
+check("minimums switched off fest-wide fall back to one entry",
+  entryCompletion({ minEntriesPerHouse: 3 }, 1, false).complete, true);
+
+/* Public rank limit — I2 */
+check("the ladder decides how many ranks exist",
+  [rankCountFromLadder({ 1: 5, 2: 3, 3: 1 }), rankCountFromLadder({ 1: 5, 2: 3, 3: 2, 4: 1 })], [3, 4]);
+check("the public limit follows the widest ladder",
+  publicRankLimit({ publicRankLimit: null }, [{ rankPoints: { 1: 5, 2: 3, 3: 1 } }, { rankPoints: { 1: 5, 2: 3, 3: 2, 4: 1 } }]), 4);
+check("an explicit override wins over the ladder",
+  publicRankLimit({ publicRankLimit: 2 }, [{ rankPoints: { 1: 5, 2: 3, 3: 1 } }]), 2);
+check("zero means show every placement",
+  [publicRankLimit({ publicRankLimit: 0 }, []), rankIsPublic(9, 0)], [0, true]);
+check("a place past the limit is not public",
+  [rankIsPublic(3, 3), rankIsPublic(4, 3), rankIsPublic(null, 3)], [true, false, false]);
+
+/* Gender is binary — I27 */
+check("gender offers only blank, male and female",
+  GENDERS.map(g => g.value), ["", "male", "female"]);
+
+/* Font scale — I18 */
+check("30pt renders near 32px at 0.42 zoom, not 180px", (() => {
+  const zoom = 0.42, scale = zoom * MM_PER_PX_AT_96DPI;
+  const px = 30 * (scale / MM_PER_PX_AT_96DPI) * (96 / 72);
+  return Math.round(px);
+})(), 17);
+check("the old formula was about 10.7 times too large", (() => {
+  const zoom = 1, scale = zoom * MM_PER_PX_AT_96DPI;
+  const wrong = 30 * scale * 3.78;
+  const right = 30 * (scale / MM_PER_PX_AT_96DPI) * (96 / 72);
+  return Math.round(wrong / right * 10) / 10;
+})(), 10.7);
+
+/* ══ v8 — the points model ═══════════════════════════════════════════
+ * These are the most important tests in the release: a mistake here moves
+ * house standings silently.
+ */
+const V8_CLASS  = { rankPoints: { 1: 5, 2: 3, 3: 1 } };
+const V8_SPEECH = { rankPoints: { 1: 10, 2: 6, 3: 2 } };
+const V8_TIER1  = { rankPoints: { 1: 20, 2: 12 }, gradePoints: { A: 9, B: 5, C: 2, Without: 0 } };
+const V8_GRADE  = { A: 5, B: 3, C: 1, Without: 0 };
+const V8_LADDERS = { categoryIndividual: V8_CLASS, type_speech: V8_SPEECH, tier_t1: V8_TIER1,
+                     stage_onStage: { rankPoints: { 1: 7 } } };
+
+check("ladder key per axis",
+  [ladderKey("class", { eventClass: "categoryIndividual" }),
+   ladderKey("stage", { stage: "offStage" }),
+   ladderKey("type", { typeId: "speech" }),
+   ladderKey("tier", { tierId: "t1" })],
+  ["categoryIndividual", "stage_offStage", "type_speech", "tier_t1"]);
+
+check("an event with no source set uses its class ladder",
+  resolvePoints({ eventClass: "categoryIndividual" }, V8_LADDERS, V8_GRADE).rankPoints,
+  V8_CLASS.rankPoints);
+
+check("naming Type uses the Type ladder",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "type", typeId: "speech" }, V8_LADDERS, V8_GRADE).rankPoints,
+  V8_SPEECH.rankPoints);
+
+check("a ladder without its own grades inherits the shared table",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "type", typeId: "speech" }, V8_LADDERS, V8_GRADE).gradePoints,
+  V8_GRADE);
+
+check("a ladder with its own grades overrides the shared table",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "tier", tierId: "t1" }, V8_LADDERS, V8_GRADE).gradePoints,
+  V8_TIER1.gradePoints);
+
+/* v1.0 — a CLASS ladder may carry its own grade points, the same override
+ * every other axis already had. resolvePoints() never cared which axis a
+ * ladder belonged to, so these lock that in rather than let a future
+ * "classes are special" branch quietly reintroduce the shared-only rule. */
+const V1_CLASS_OWN = { rankPoints: { 1: 10, 2: 6 }, gradePoints: { A: 50, B: 30, C: 10, Without: 0 } };
+
+check("a class ladder with its own grades overrides the shared table",
+  resolvePoints({ eventClass: "categoryIndividual" },
+    { categoryIndividual: V1_CLASS_OWN }, V8_GRADE).gradePoints,
+  V1_CLASS_OWN.gradePoints);
+
+check("a class ladder without its own grades still inherits the shared table",
+  resolvePoints({ eventClass: "categoryIndividual" },
+    { categoryIndividual: { rankPoints: { 1: 10 } } }, V8_GRADE).gradePoints,
+  V8_GRADE);
+
+// null is what the settings screen writes when the override is switched
+// OFF — omitting the key let a stale table survive Firestore's merge.
+check("a class ladder whose grades are null inherits the shared table",
+  resolvePoints({ eventClass: "categoryIndividual" },
+    { categoryIndividual: { rankPoints: { 1: 10 }, gradePoints: null } }, V8_GRADE).gradePoints,
+  V8_GRADE);
+
+check("a class grade override changes what the same mark is worth", (() => {
+  const entries = [{ regId: "r1", scores: [90], isAbsent: false }];
+  const opts = { scoreScale: 100, thresholds: { aMin: 85, bMin: 70, cMin: 50 } };
+  const own = computeResults(entries, { ...opts, rankPoints: V1_CLASS_OWN.rankPoints,
+    gradePoints: V1_CLASS_OWN.gradePoints })[0];
+  const shared = computeResults(entries, { ...opts, rankPoints: V1_CLASS_OWN.rankPoints,
+    gradePoints: V8_GRADE })[0];
+  return [own.totalPoints, shared.totalPoints];
+})(), [60, 10 + (V8_GRADE.A ?? 0)]);
+
+check("ONE SOURCE ONLY — naming Type ignores tier and stage entirely",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "type", typeId: "speech", tierId: "t1", stage: "onStage" }, V8_LADDERS, V8_GRADE).rankPoints,
+  V8_SPEECH.rankPoints);
+
+check("a missing ladder falls back to the class ladder and is flagged", (() => {
+  const r = resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "type", typeId: "nope" }, V8_LADDERS, V8_GRADE);
+  return [r.source, r.fellBack];
+})(), ["class", true]);
+
+check("v9 — a custom pointsFrom uses the event's own ladder, ignoring class entirely", (() => {
+  const r = resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "custom",
+    customRankPoints: { 1: 30, 2: 20, 3: 15 } }, V8_LADDERS, V8_GRADE);
+  return [r.source, r.fellBack, r.rankPoints, r.gradePoints];
+})(), ["custom", false, { 1: 30, 2: 20, 3: 15 }, V8_GRADE]);
+
+check("v9 — custom with no points set awards nothing, no fallback to class", (() => {
+  const r = resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "custom" }, V8_LADDERS, V8_GRADE);
+  return [r.source, r.rankPoints];
+})(), ["custom", {}]);
+
+/* v9 — category as a points axis, and per-event custom grade points */
+check("naming Category uses the category's own ladder",
+  ladderKey("category", { categoryId: "senior" }),
+  "category_senior");
+
+const V9_CATEGORY_LADDERS = { ...V8_LADDERS, category_senior: { rankPoints: { 1: 25, 2: 15 } } };
+check("a Category-sourced event uses that category's ladder, not its class",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "category", categoryId: "senior" }, V9_CATEGORY_LADDERS, V8_GRADE).rankPoints,
+  { 1: 25, 2: 15 });
+
+check("a mixed event's category source reads its first categoryId",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "category", categoryId: "senior", categoryIds: ["senior", "junior"] }, V9_CATEGORY_LADDERS, V8_GRADE).rankPoints,
+  { 1: 25, 2: 15 });
+
+check("a custom event with its own grade points ignores the shared table", (() => {
+  const r = resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "custom",
+    customRankPoints: { 1: 30 }, customGradePoints: { A: 99, Without: 0 } }, V8_LADDERS, V8_GRADE);
+  return [r.gradePoints, r.rankPoints];
+})(), [{ A: 99, Without: 0 }, { 1: 30 }]);
+
+check("a custom event with no grade points of its own falls back to the shared table",
+  resolvePoints({ eventClass: "categoryIndividual", pointsFrom: "custom", customRankPoints: { 1: 30 } }, V8_LADDERS, V8_GRADE).gradePoints,
+  V8_GRADE);
+
+/* Gradeless events */
+const V8_E = [{ regId: "a", scores: [90] }, { regId: "b", scores: [80] }];
+const V8_TH = { aMin: 85, bMin: 70, cMin: 50 };
+check("gradeless keeps the grade visible but worth nothing", (() => {
+  const out = computeResults(V8_E, { scoreScale: 100, thresholds: V8_TH, rankPoints: V8_CLASS.rankPoints, gradePoints: V8_GRADE, awardsGradePoints: false });
+  const a = out.find(e => e.regId === "a");
+  return [a.grade, a.gradePoints, a.totalPoints];
+})(), ["A", 0, 5]);
+
+/* Direct results */
+check("direct mode: tied placements each take the full rank points", (() => {
+  const out = computeDirectResults(
+    [{ regId: "x", placement: 1, grade: "A" }, { regId: "y", placement: 1, grade: "B" }, { regId: "z", placement: 2, grade: "C" }],
+    { rankPoints: V8_CLASS.rankPoints, gradePoints: V8_GRADE });
+  return [out[0].rankPoints, out[1].rankPoints, out.map(r => r.rank)];
+})(), [5, 5, [1, 1, 2]]);
+
+check("direct mode: absence still scores nothing", (() => {
+  const out = computeDirectResults([{ regId: "w", isAbsent: true }], { rankPoints: V8_CLASS.rankPoints, gradePoints: V8_GRADE });
+  return [out[0].rank, out[0].grade, out[0].totalPoints];
+})(), [null, "Absent", 0]);
+
+check("direct mode blocks finalize until every entry has a placement",
+  directFinalizeBlockers([{ regId: "a", placement: null }, { regId: "b", placement: 1 }]), ["a"]);
+
+// "Took part, no place" is a real answer, stored as 0. Most of the field in
+// a placement event does not place, and marking those people Absent to get
+// past Finalize would publish something untrue about them.
+check("direct mode: an explicit no-place (0) does not block finalize",
+  directFinalizeBlockers([{ regId: "a", placement: 0 }, { regId: "b", placement: 1 }]), []);
+
+check("direct mode: undefined placement still blocks, same as null",
+  directFinalizeBlockers([{ regId: "a" }, { regId: "b", placement: 0 }]), ["a"]);
+
+check("direct mode: no-place takes no rank and scores nothing", (() => {
+  const out = computeDirectResults([{ regId: "n", placement: 0, grade: "A" }],
+    { rankPoints: V8_CLASS.rankPoints, gradePoints: V8_GRADE });
+  return [out[0].rank, out[0].rankPoints];
+})(), [null, 0]);
+
+/* Firestore rejects undefined outright, so every field finalizeEvent writes
+ * has to be a real value. A direct event has no marks, so averageScore and
+ * percent are null — they were simply absent, which made finalizing any
+ * placement event fail with "Unsupported field value: undefined". */
+check("direct mode: averageScore and percent are null, never undefined", (() => {
+  const out = computeDirectResults(
+    [{ regId: "p", placement: 1 }, { regId: "q", isAbsent: true }],
+    { rankPoints: V8_CLASS.rankPoints, gradePoints: V8_GRADE });
+  return out.flatMap(r => [r.averageScore === null, r.percent === null]);
+})(), [true, true, true, true]);
+
+check("direct mode: no result row carries an undefined value", (() => {
+  const out = computeDirectResults(
+    [{ regId: "p", placement: 0 }, { regId: "q", placement: 2, grade: "B" }, { regId: "r", isAbsent: true }],
+    { rankPoints: V8_CLASS.rankPoints, gradePoints: V8_GRADE });
+  return out.every(row => Object.values(row).every(v => v !== undefined));
+})(), true);
+
+/* Per-category participant limits */
+check("per-category off behaves exactly as before",
+  limitsForCategory({ overallMax: 5, perCategory: false, byCategory: {} }, "c1").overallMax, 5);
+check("a category override is used wholesale, and others fall back", (() => {
+  const L = { overallMax: 5, perCategory: true, byCategory: { c1: { overallMax: 2 } } };
+  return [limitsForCategory(L, "c1").overallMax, limitsForCategory(L, "c2").overallMax];
+})(), [2, 5]);
+
+/* Optional tiebreakers */
+check("with tiebreakers off, tied participants share a rank",
+  rankLeaderboard([{ name: "A", total: 10, pools: { generalGroupPoints: 1 } },
+                   { name: "B", total: 10, pools: { generalGroupPoints: 9 } }], []).map(r => r.rank),
+  [1, 1]);
+
+/* ══ v8.6 ════════════════════════════════════════════════════════════ */
+
+/* Caps: participant's own category, General outside class caps,
+   Type/Tier counted everywhere */
+const V86_JR = { overallMax: 6,
+  categoryIndividual: { splitByStage: true, max: 4, onStageMax: 2 },
+  categoryGroup: { max: 2 }, generalIndividual: {}, generalGroup: {},
+  useTypeCaps: true, typeCaps: { speech: { max: 2 } } };
+const V86_SR = { overallMax: 8, categoryIndividual: { splitByStage: false, max: 5 },
+  categoryGroup: {}, generalIndividual: {}, generalGroup: {},
+  useTypeCaps: true, typeCaps: { speech: { max: 3 } } };
+const V86_G = { overallMax: 5, categoryIndividual: { max: 3 }, categoryGroup: {},
+  generalIndividual: {}, generalGroup: {}, perCategory: true,
+  byCategory: { jr: V86_JR, sr: V86_SR } };
+
+check("a participant is measured against their own category",
+  [limitsForCategory(V86_G, "jr").overallMax, limitsForCategory(V86_G, "sr").overallMax], [6, 8]);
+
+const V86_CAT = { eventClass: "categoryIndividual", stage: "onStage", typeId: "speech" };
+const V86_GEN = { eventClass: "generalIndividual", stage: "onStage", typeId: "speech" };
+
+check("a Category event reads its class cap",  maxFor("categoryIndividual", V86_JR), 4);
+check("a General event still counts toward Type",
+  counterKeys(V86_GEN, V86_JR).includes("type:speech"), true);
+check("a General event does not add another class's counter key",
+  counterKeys(V86_GEN, V86_JR).includes("categoryIndividual"), false);
+
+/* ── v9 — the nine-cap hierarchy ─────────────────────────────────── */
+const CAPS88 = {
+  overallMax: 20,
+  useRollupCaps: true,
+  group: { max: 4 }, individual: { max: 6 },
+  category: { max: 5 }, general: { max: 3 },
+  categoryIndividual: { splitByStage: true, max: 3, onStageMax: 2, offStageMax: 2 },
+  categoryGroup:      { splitByStage: true, max: 3, onStageMax: 1, offStageMax: 2 },
+  generalIndividual:  { max: 2 },
+  generalGroup:       { splitByStage: false, max: 1 }
+};
+const CI_ON  = { eventClass: "categoryIndividual", stage: "onStage" };
+const CG_OFF = { eventClass: "categoryGroup", stage: "offStage" };
+const GI_ON  = { eventClass: "generalIndividual", stage: "onStage" };
+const GG_ON  = { eventClass: "generalGroup", stage: "onStage" };
+
+// ⚠ behaviour change — these two were silently inert before v9.
+check("a General Individual cap now actually enforces",
+  maxFor("generalIndividual", CAPS88), 2);
+check("a General Group cap now actually enforces",
+  maxFor("generalGroup", CAPS88), 1);
+
+check("every class belongs to exactly two roll-ups", [
+  counterKeys(CI_ON,  CAPS88).filter(k => k.startsWith("rollup:")).sort(),
+  counterKeys(CG_OFF, CAPS88).filter(k => k.startsWith("rollup:")).sort(),
+  counterKeys(GI_ON,  CAPS88).filter(k => k.startsWith("rollup:")).sort(),
+  counterKeys(GG_ON,  CAPS88).filter(k => k.startsWith("rollup:")).sort()
+], [
+  ["rollup:category", "rollup:individual"],
+  ["rollup:category", "rollup:group"],
+  ["rollup:general", "rollup:individual"],
+  ["rollup:general", "rollup:group"]
+]);
+
+check("a group event counts to the group roll-up but not the individual one",
+  [counterKeys(CG_OFF, CAPS88).includes("rollup:group"),
+   counterKeys(CG_OFF, CAPS88).includes("rollup:individual")], [true, false]);
+
+check("group events can now split by stage too",
+  counterKeys(CG_OFF, CAPS88).includes("categoryGroup.offStage"), true);
+check("a class with splitByStage off adds no stage key",
+  counterKeys(GG_ON, CAPS88).includes("generalGroup.onStage"), false);
+
+check("a split class still enforces its combined max across both stages",
+  [maxFor("categoryIndividual", CAPS88),
+   maxFor("categoryIndividual.onStage", CAPS88)], [3, 2]);
+
+check("roll-ups are inert until the fest switches them on",
+  maxFor("rollup:group", { ...CAPS88, useRollupCaps: false }), null);
+
+// The tightest applicable cap is what blocks — the whole point of a
+// hierarchy is that every level is checked, not just the most specific.
+check("the roll-up blocks even when the class cap has room", (() => {
+  const counts = { overall: 4, categoryGroup: 1, "rollup:group": 4, "rollup:category": 1 };
+  return !!checkCaps(counts, CG_OFF, CAPS88);
+})(), true);
+check("and the class cap blocks even when the roll-up has room", (() => {
+  const counts = { overall: 3, generalGroup: 1, "rollup:group": 1, "rollup:general": 1 };
+  return !!checkCaps(counts, GG_ON, CAPS88);
+})(), true);
+check("a registration inside every cap is allowed", (() => {
+  const counts = { overall: 1, categoryIndividual: 0, "rollup:individual": 0, "rollup:category": 0 };
+  return checkCaps(counts, CI_ON, CAPS88);
+})(), null);
+
+check("the stage cap blocks while the combined class cap still has room", (() => {
+  const counts = { overall: 2, categoryGroup: 1, "categoryGroup.onStage": 1,
+                   "rollup:group": 1, "rollup:category": 1 };
+  return !!checkCaps(counts, { eventClass: "categoryGroup", stage: "onStage" }, CAPS88);
+})(), true);
+
+check("the compliance report now covers a General minimum", (() => {
+  const lim = { generalIndividual: { min: 2 }, categoryIndividual: {}, categoryGroup: {}, generalGroup: {} };
+  return shortfallsV8({ generalIndividual: 0 }, lim).some(s => s.key === "generalIndividual");
+})(), true);
+check("and a roll-up minimum", (() => {
+  const lim = { useRollupCaps: true, group: { min: 2 },
+                categoryIndividual: {}, categoryGroup: {}, generalIndividual: {}, generalGroup: {} };
+  return shortfallsV8({ "rollup:group": 0 }, lim).some(s => s.key === "rollup:group");
+})(), true);
+check("the Type cap value comes from the participant's own category",
+  [maxFor("type:speech", V86_JR), maxFor("type:speech", V86_SR)], [2, 3]);
+
+check("split-by-stage is per category",
+  [counterKeys(V86_CAT, V86_JR).includes("categoryIndividual.onStage"),
+   counterKeys(V86_CAT, V86_SR).includes("categoryIndividual.onStage")], [true, false]);
+
+check("recount rebuilds counts from registrations, ignoring stale keys", (() => {
+  const evs = { e1: V86_CAT, e2: V86_GEN };
+  const regs = [{ eventId: "e1", participantIds: ["p"] }, { eventId: "e2", participantIds: ["p"] }];
+  const c = recountParticipant({ id: "p", categoryId: "jr" }, regs, evs, V86_G);
+  return [c.overall, c["type:speech"], c.categoryIndividual];
+})(), [2, 2, 1]);
+
+/* Timezone — DST-correct, the bug the fixed offset could not handle */
+check("a valid zone is recognised", [isValidZone("Asia/Kolkata"), isValidZone("Not/AZone")], [true, false]);
+check("IST is +5:30 all year",
+  [offsetMinutesAt("Asia/Kolkata", Date.parse("2026-01-14T00:00:00Z")),
+   offsetMinutesAt("Asia/Kolkata", Date.parse("2026-07-14T00:00:00Z"))], [330, 330]);
+check("London shifts with daylight saving",
+  [offsetMinutesAt("Europe/London", Date.parse("2026-01-14T12:00:00Z")),
+   offsetMinutesAt("Europe/London", Date.parse("2026-07-14T12:00:00Z"))], [0, 60]);
+check("10:30 IST is 05:00 UTC",
+  wallClockToEpoch("2026-01-14", "10:30", "Asia/Kolkata"), Date.parse("2026-01-14T05:00:00Z"));
+check("the same wall clock differs across a DST boundary",
+  [wallClockToEpoch("2026-03-28", "12:00", "Europe/London"),
+   wallClockToEpoch("2026-03-29", "12:00", "Europe/London")],
+  [Date.parse("2026-03-28T12:00:00Z"), Date.parse("2026-03-29T11:00:00Z")]);
+
+/* Substitutions — the window — v9: granted per house, not one event-wide switch */
+check("substitution is refused until an Admin opens it for the event",
+  substitutionWindow({ houseId: "red" }, {}, {}).open, false);
+check("opening it for one house does not open it for another",
+  [substitutionWindow({ houseId: "red" }, { substitutionOpenFor: { red: true } }, {}).open,
+   substitutionWindow({ houseId: "blue" }, { substitutionOpenFor: { red: true } }, {}).open],
+  [true, false]);
+check("__all opens it for every house at once",
+  substitutionWindow({ houseId: "blue" }, { substitutionOpenFor: { __all: true } }, {}).open, true);
+check("a code letter closes the window for good, even when open",
+  substitutionWindow({ houseId: "red", codeLetter: "C" }, { substitutionOpenFor: { red: true } }, {}).open, false);
+check("pending requests are counted",
+  pendingCount([{ status: "pending" }, { status: "approved" }, { status: "pending" }]), 2);
+
+/* Fest-wide result policy */
+check("policy 'both' lets the event decide",
+  [effectiveResultMode({ resultMode: "direct" }, { resultPolicy: "both" }),
+   effectiveResultMode({ resultMode: "scored" }, { resultPolicy: "both" })], ["direct", "scored"]);
+check("a forced policy overrides every event",
+  [effectiveResultMode({ resultMode: "scored" }, { resultPolicy: "direct" }),
+   effectiveResultMode({ resultMode: "direct" }, { resultPolicy: "scored" })], ["direct", "scored"]);
+check("no policy set behaves as before", effectiveResultMode({ resultMode: "direct" }, {}), "direct");
+
+/* Rank ceiling reads every ladder, not just the class ones */
+check("a longer Type ladder raises the rank ceiling",
+  highestRankAwarded([{ rankPoints: { 1: 5, 2: 3, 3: 1 } },
+                      { rankPoints: { 1: 9, 2: 7, 3: 5, 4: 3, 5: 2, 6: 1 } }]), 6);
+
+/* Boards: ticked events override the axes */
+check("ticking events replaces the axis filters",
+  [boardMatchesEvent({ eventIds: ["e2"], typeIds: ["speech"] }, { id: "e2", typeId: "essay" }),
+   boardMatchesEvent({ eventIds: ["e2"] }, { id: "e1", typeId: "speech" })], [true, false]);
+
+/* Boards: qualification constraints — v9 */
+(() => {
+  const eventById = { e1: { id: "e1", eventClass: "categoryIndividual" }, e2: { id: "e2", eventClass: "categoryIndividual" } };
+  const results = [
+    { id: "e1", entries: [
+      { isAbsent: false, totalPoints: 5, rank: 1, grade: "A", entryCategoryId: "junior",
+        participantIds: ["p1"], participantNames: ["Alice"], chestNumbers: ["1"], houseName: "Red" },
+      { isAbsent: false, totalPoints: 3, rank: 2, grade: "B", entryCategoryId: "senior",
+        participantIds: ["p2"], participantNames: ["Bob"], chestNumbers: ["2"], houseName: "Blue" }
+    ]},
+    { id: "e2", entries: [
+      { isAbsent: false, totalPoints: 5, rank: 1, grade: "A", entryCategoryId: "junior",
+        participantIds: ["p2"], participantNames: ["Bob"], chestNumbers: ["2"], houseName: "Blue" },
+      { isAbsent: false, totalPoints: 1, rank: 3, grade: "C", entryCategoryId: "junior",
+        participantIds: ["p1"], participantNames: ["Alice"], chestNumbers: ["1"], houseName: "Red" }
+    ]}
+  ];
+
+  check("with no qualification rule every point counts",
+    tallyBoard({}, results, eventById).map(r => [r.id, r.total]), [["p2", 8], ["p1", 6]]);
+
+  check("qualifying twice in the top 1 excludes everyone when nobody did",
+    tallyBoard({ qualifyMode: "rank", qualifyMaxRank: 1, qualifyMinCount: 2 }, results, eventById).length, 0);
+
+  check("qualifying once in the top 1 keeps a participant's WHOLE total, not just the qualifying entry",
+    tallyBoard({ qualifyMode: "rank", qualifyMaxRank: 1, qualifyMinCount: 1 }, results, eventById)
+      .find(r => r.id === "p1").total, 6);
+
+  check("a grade qualification only admits participants who earned it",
+    tallyBoard({ qualifyMode: "grade", qualifyGrades: ["A"], qualifyMinCount: 1 }, results, eventById)
+      .map(r => r.id).sort(), ["p1", "p2"]);
+
+  check("category scope is the PARTICIPANT'S category per entry, not the event's",
+    tallyBoard({ qualifyCategoryIds: ["junior"] }, results, eventById).map(r => [r.id, r.total]),
+    [["p1", 6], ["p2", 5]]);
+
+  check("mutual exclusion drops the excluded id and leaves the rest ranked",
+    tallyBoard({}, results, eventById, {}, { excludeId: "p1" }).map(r => r.id), ["p2"]);
+})();
+
+/* ══ v8.7 — schedule clashes ═════════════════════════════════════════
+ * The clash that actually bites on the day: a person needed in two places
+ * at once. Warned, never blocked — real fests overlap deliberately.
+ */
+check("touching slots do not overlap",
+  [overlaps(600, 630, 610, 640), overlaps(600, 630, 630, 660)], [true, false]);
+
+const V87_SLOTS = [
+  { eventId: "e1", dayId: "d1", venueName: "Stage 1", title: "Solo Song",
+    startMin: 600, endMin: 630, startTime: "10:00", endTime: "10:30" },
+  { eventId: "e2", dayId: "d1", venueName: "Hall A", title: "Essay",
+    startMin: 610, endMin: 640, startTime: "10:10", endTime: "10:40" },
+  { eventId: "e3", dayId: "d2", venueName: "Hall A", title: "Skit",
+    startMin: 610, endMin: 640, startTime: "10:10", endTime: "10:40" }
+];
+const V87_PEOPLE = {
+  e1: [{ id: "p1", name: "Ann", role: "participant" }],
+  e2: [{ id: "p1", name: "Ann", role: "participant" }, { id: "p2", name: "Bob", role: "participant" }],
+  e3: [{ id: "p1", name: "Ann", role: "participant" }]
+};
+
+check("a participant in two overlapping events is a clash",
+  findClashes(V87_SLOTS, V87_PEOPLE).map(c => c.name), ["Ann"]);
+check("the same time on a DIFFERENT DAY is not a clash",
+  findClashes(V87_SLOTS, V87_PEOPLE).some(c => c.a.eventId === "e3" || c.b.eventId === "e3"), false);
+check("someone in only one of the two is not clashing",
+  findClashes(V87_SLOTS, V87_PEOPLE).some(c => c.name === "Bob"), false);
+check("a judge in two overlapping events is a clash", (() => {
+  const j = { e1: [{ id: "j1", name: "Judge A", role: "judge" }],
+              e2: [{ id: "j1", name: "Judge A", role: "judge" }] };
+  const out = findClashes(V87_SLOTS, j);
+  return [out.length, out[0].role];
+})(), [1, "judge"]);
+check("the same id in different roles is not a clash",
+  findClashes(V87_SLOTS, { e1: [{ id: "x", name: "X", role: "judge" }],
+                           e2: [{ id: "x", name: "X", role: "participant" }] }).length, 0);
+check("both venues are named, so the clash can be acted on", (() => {
+  const c = findClashes(V87_SLOTS, V87_PEOPLE)[0];
+  return [c.a.venueName, c.b.venueName];
+})(), ["Stage 1", "Hall A"]);
+check("slots with no time are ignored",
+  findClashes([{ eventId: "e1", dayId: "d1" }, { eventId: "e2", dayId: "d1" }], V87_PEOPLE).length, 0);
+check("a clash summary names the person",
+  /Ann/.test(describeClashes(findClashes(V87_SLOTS, V87_PEOPLE))), true);
+
+/* v9 — mixed-category events. One event open to several categories at
+ * once, competing in ONE combined ranking. */
+const V9_CATNAME = { k: "Kids", sj: "Sub Junior", jr: "Junior" };
+const V9_MIXED   = { eventClass: "categoryIndividual", code: "12", name: "Handwriting",
+                     categoryId: "k", categoryIds: ["k", "sj"] };
+const V9_SINGLE  = { eventClass: "categoryIndividual", code: "13", name: "Essay", categoryId: "jr" };
+const V9_GENERAL = { eventClass: "generalIndividual", code: "14", name: "Quiz" };
+
+check("a mixed event lists every category it is open to",
+  eventCategoryIds(V9_MIXED), ["k", "sj"]);
+
+check("a single-category event still reports exactly one",
+  eventCategoryIds(V9_SINGLE), ["jr"]);
+
+check("a general event names no category at all",
+  eventCategoryIds(V9_GENERAL), []);
+
+check("only an event with two or more categories counts as mixed",
+  [isMixedCategory(V9_MIXED), isMixedCategory(V9_SINGLE), isMixedCategory(V9_GENERAL)],
+  [true, false, false]);
+
+check("a mixed event accepts either of its categories and refuses the rest",
+  [eventAcceptsCategory(V9_MIXED, "k"),
+   eventAcceptsCategory(V9_MIXED, "sj"),
+   eventAcceptsCategory(V9_MIXED, "jr")],
+  [true, true, false]);
+
+check("a single-category event is unchanged by the mixed-category code",
+  [eventAcceptsCategory(V9_SINGLE, "jr"), eventAcceptsCategory(V9_SINGLE, "k")],
+  [true, false]);
+
+check("a general event accepts anyone",
+  eventAcceptsCategory(V9_GENERAL, "whatever"), true);
+
+check("a mixed event's label names both categories",
+  eventCategoryLabel(V9_MIXED, V9_CATNAME), "Kids and Sub Junior");
+
+check("a mixed event's category survives into its full display label",
+  eventLabel(V9_MIXED, V9_CATNAME), "12 · Handwriting (Kids and Sub Junior)");
+
+// The CSV column is a DATA format, not the display label: the importer
+// splits it on "+" to rebuild the event, so it must stay splittable even
+// though humans now read "Kids and Sub Junior".
+check("the CSV category column stays +-joined so it can be read back",
+  eventCategoryExportLabel(V9_MIXED, V9_CATNAME), "Kids + Sub Junior");
+check("a single-category event exports just its category name",
+  eventCategoryExportLabel(V9_SINGLE, V9_CATNAME), "Junior");
+check("a general event exports a blank category column",
+  eventCategoryExportLabel(V9_GENERAL, V9_CATNAME), "");
+
+check("a mixed event is filterable under EVERY category it is open to",
+  eventFilterKeys(V9_MIXED).filterCategory, ["k", "sj"]);
+
+/* House color shading — item 3, score-card background/foreground */
+check("shadeColor mixes toward black at a negative amount",
+  shadeColor("#808080", -50), "#010101");
+
+check("shadeColor mixes toward white at a positive amount",
+  shadeColor("#808080", 50), "#ffffff");
+
+check("shadeColor clamps rather than wrapping past black or white",
+  [shadeColor("#101010", -100), shadeColor("#f0f0f0", 100)], ["#000000", "#ffffff"]);
+
+check("shadeColor accepts the 3-digit shorthand",
+  shadeColor("#fff", -50), shadeColor("#ffffff", -50));
+
+check("darkenColor is strictly darker than the source, lightenColor strictly lighter", (() => {
+  const src = "#4c7a5a";
+  return [darkenColor(src) < src, lightenColor(src) > src];
+})(), [true, true]);
+
+// The summary must run LAST — it used to sit mid-file, from a point in
+// this file's history where that mid-point was briefly the end. Every
+// check() added below it since then ran and rendered its own PASS/FAIL
+// row, but was silently left out of this total. Moved here so the count
+// can be trusted again.
+const summary = document.createElement("div");
+summary.className = "notice notice-" + (fail ? "danger" : "ok");
+summary.style.fontWeight = "600";
+summary.textContent = `${pass} passed, ${fail} failed`;
+out.prepend(summary);
+</script>
+</body>
+</html>

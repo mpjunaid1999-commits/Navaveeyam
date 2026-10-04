@@ -1,0 +1,940 @@
+rules_version = '2';
+
+// ══════════════════════════════════════════════════════════════════════
+//  Fest Tabulation — Security Rules
+//
+//  There is no server in this app. These rules ARE the permission system:
+//  every restriction in the interface is backed by a rule here, and the
+//  interface hiding a button is only cosmetic. If you change one, change
+//  the other.
+//
+//  Paste this whole file into Firebase console → Firestore → Rules → Publish.
+// ══════════════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Identity helpers ─────────────────────────────────────────────
+    function signedIn() {
+      return request.auth != null;
+    }
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function role() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? profile().role : "public";
+    }
+    function refId() {
+      return profile().refId;
+    }
+    function isAdmin()   { return role() == "admin"; }
+    function isCoAdmin() { return role() == "coAdmin"; }
+    function isStaff()   { return isAdmin() || isCoAdmin(); }
+    function isJudge()   { return role() == "judge"; }
+    function isHouse()   { return role() == "house"; }
+    // The stage crew. Reads entries so they can call people up, letters them,
+    // and ticks them in. Cannot score, finalize or publish.
+    function isStage()   { return role() == "stage"; }
+
+    // The fest has not been created yet. Only true once, during first-run
+    // setup — writing config/festSettings closes this window for good.
+    function inBootstrap() {
+      return !exists(/databases/$(database)/documents/config/festSettings);
+    }
+
+    function settings() {
+      return get(/databases/$(database)/documents/config/festSettings).data;
+    }
+    function limits() {
+      return get(/databases/$(database)/documents/config/participantLimits).data;
+    }
+    function eventDoc(eventId) {
+      return get(/databases/$(database)/documents/events/$(eventId)).data;
+    }
+    function assignedToEvent(eventId) {
+      return exists(/databases/$(database)/documents/judgeAssignments/$(eventId + "_" + request.auth.uid));
+    }
+
+    // I14 — a published event is frozen.
+    //
+    // The Judging screen renders read-only when a result is published, but
+    // that is only cosmetic. THIS is the enforcement: while an event's
+    // result says Published, nobody — not even an Admin — may write a score
+    // or an absence flag for it. Unpublish on the Results screen first.
+    function resultPublished(eventId) {
+      return exists(/databases/$(database)/documents/results/$(eventId))
+        && get(/databases/$(database)/documents/results/$(eventId)).data.publishStatus == "Published";
+    }
+
+    // v9.2 / I22 — a FINALIZED event freezes scores too, not just a
+    // published one. A results doc only ever exists once finalizeEvent()
+    // has run at least once, Finalized or Published, so its mere existence
+    // is exactly "this event's marks have already been computed into a
+    // result — editing now needs Unfinalize first, not a silent rewrite."
+    // Used only for scores/entryFlags/directResults/scoreOverrides, the
+    // four things that move points; codeLetter reassignment and
+    // judgingEntries stay on resultPublished() as before — a lettering
+    // fix between finalize and publish is not a score correction.
+    function resultLocked(eventId) {
+      return exists(/databases/$(database)/documents/results/$(eventId));
+    }
+
+    // The appeal window closes itself. publishedAtMs is plain epoch
+    // milliseconds set alongside the server timestamp at publish time —
+    // rules can only compare request.time against a value they can convert
+    // themselves, the same reason registration windows are stored as ms.
+    function appealWindowOpen(eventId) {
+      // exists() FIRST, matching resultPublished() above. Without it, a
+      // missing result document makes get() return null and the field
+      // access below a rule EVALUATION ERROR — which reaches the user as
+      // "You do not have permission", not as a clean refusal. The client
+      // already blocks this path, but a rule that errors on absent data is
+      // the exact failure this project has debugged twice already.
+      return exists(/databases/$(database)/documents/results/$(eventId))
+        && appealWindowOpenFor(get(/databases/$(database)/documents/results/$(eventId)).data);
+    }
+    function appealWindowOpenFor(res) {
+      let s = settings();
+      // v9.2 — minutes, not hours. appealWindowHours is read only as a
+      // fallback for a fest that saved its window before this change,
+      // matching js/domain/appeals.js's appealWindowState() exactly —
+      // client and rules must agree, or one refuses what the other allows.
+      let minutes = s.appealWindowMinutes != null
+        ? s.appealWindowMinutes
+        : (s.appealWindowHours == null ? 24 : s.appealWindowHours) * 60;
+      // publishedAtMs is v9. An event published BEFORE this upgrade does
+      // not carry it, so its window reads as closed — the safe answer, and
+      // the same one appealWindowState() reaches in the browser. Publish
+      // the event again to open an appeal window on it.
+      return res.publishStatus == "Published"
+        && res.publishedAtMs != null
+        && request.time <= timestampOf(res.publishedAtMs + minutes * 60 * 1000);
+    }
+
+    // ── Configuration ────────────────────────────────────────────────
+    // Public read: the home page needs the fest name, House Managers need
+    // the limits, judges need the score scale. None of it is sensitive.
+    match /config/{docId} {
+      allow read: if true;
+      allow write: if isAdmin()
+                   || (inBootstrap() && signedIn())
+                   // Co-Admins may flip the schedule visibility toggle, and
+                   // staff reserve chest / event numbers from the counters.
+                   || (isCoAdmin() && docId == "festSettings"
+                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["scheduleVisible"]))
+                   || (isStaff() && docId == "counters");
+    }
+
+    match /pointsConfig/{classId} {
+      allow read: if true;
+      allow write: if isAdmin() || (inBootstrap() && signedIn());
+    }
+
+    // ── Accounts ─────────────────────────────────────────────────────
+    // The role document is the whole authorisation system. A user may read
+    // their own and nothing else; only an Admin may write any of them.
+    match /users/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow create: if isAdmin()
+                    || (inBootstrap() && request.auth.uid == uid && request.resource.data.role == "admin");
+      allow update, delete: if isAdmin();
+    }
+
+    // Names shown in the login dropdown. Public by necessity, and harmless:
+    // it holds no password material of any kind.
+    match /loginDirectory/{slug} {
+      allow read: if true;
+      allow write: if isAdmin() || (inBootstrap() && signedIn());
+    }
+
+    // I9 — append-only audit trail. Admin-only read, matching "which
+    // admin can see" — a Co-Admin, House or Judge seeing who-logged-in-when
+    // across every OTHER account would be a privacy leak this fest never
+    // asked for, not an oversight tool for them. Anyone signed in may
+    // append an entry, but only their OWN —
+    // request.resource.data.uid must equal the caller's own uid, so
+    // nobody can write a false entry attributed to someone else. Never
+    // update or delete: an audit log that can be edited after the fact
+    // is not an audit log.
+    match /auditLog/{id} {
+      allow read: if isAdmin();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /houses/{houseId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /judges/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /coAdmins/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /stageManagers/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // I9 — where and when a Stage Manager works, moved out of a single
+    // venueId/startTime/endTime on the stageManagers record itself (which
+    // could only ever hold one) and into its own per-assignment doc, the
+    // same shape judgeAssignments already uses for "who, where, when".
+    // Admin manages these from the Schedule screen; a Stage Manager may
+    // only ever read their own.
+    match /stageAssignments/{id} {
+      allow read: if isStaff() || (isStage() && resource.data.stageRefId == refId());
+      allow write: if isAdmin();
+    }
+    match /categories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ── Events, venues, schedule ─────────────────────────────────────
+    match /events/{eventId} {
+      allow read: if true;
+      allow write: if isStaff();
+      match /{sub=**} {
+        allow read: if true;
+        allow write: if isStaff();
+      }
+    }
+
+    match /venues/{venueId} {
+      allow read: if true;
+      allow write: if isStaff();
+      match /slots/{slotId} {
+        allow read: if true;
+        allow write: if isStaff();
+      }
+    }
+
+    // Days of the fest. Public, because the schedule is public.
+    match /festDays/{dayId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    // v8 — the delete-everything guard. Admin-only both ways: it must never
+    // be publicly readable (config/* is, deliberately), because that would
+    // let anyone fetch the salted hash to attack offline.
+    match /guard/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // v8 — placements for "direct" events, where an Admin picks the order
+    // instead of judges scoring. These move points exactly as a score does,
+    // so they carry the same published-lock and the same Admin-only rule.
+    match /directResults/{docId} {
+      allow read: if isStaff() || isJudge();
+      // A judge assigned to the event may set placements — a direct event is
+      // judged, just by picking a place rather than typing a mark. Same
+      // published-lock as scores, because a placement moves points too.
+      allow write: if !resultLocked(
+                        request.method == "delete"
+                          ? resource.data.eventId
+                          : request.resource.data.eventId)
+                   && (isAdmin()
+                       || (isJudge() && assignedToEvent(request.resource.data.eventId)));
+    }
+
+    // v8 — substitutions.
+    //
+    // A House Manager may ASK but never DECIDE: they can create a request
+    // for their own house, and only with status "pending". Any write that
+    // sets an outcome is staff-only. That split is the whole point of the
+    // workflow, so it is enforced here rather than trusted to the UI.
+    //
+    // Substitution is closed by default per event — an Admin opens it on
+    // the events they choose (events/{eventId}.substitutionOpen). The UI
+    // hides the request button when it's closed; this re-checks the same
+    // flag so a hand-crafted write can't route around that.
+    match /substitutions/{id} {
+      allow read: if isStaff()
+                  || (isHouse() && resource.data.houseId == refId());
+
+      allow create: if isStaff()
+                    || (isHouse()
+                        && request.resource.data.houseId == refId()
+                        && request.resource.data.status == "pending"
+                        // exists() FIRST — a stale eventId (event deleted
+                        // after the house's page loaded) must read as a
+                        // clean refusal, not a rules EVALUATION ERROR.
+                        && exists(/databases/$(database)/documents/events/$(request.resource.data.eventId))
+                        && substitutionOpenFor(eventDoc(request.resource.data.eventId), refId()));
+
+      // Approving or rejecting is a staff act. A House Manager cannot edit
+      // a request once it is in the queue — withdrawing an ask is done by
+      // the organiser, so the audit trail stays intact.
+      allow update, delete: if isStaff();
+    }
+    // v9 — granted per house, not as one blanket switch for every house
+    // registered in the event. substitutionOpenFor is a map of houseId (or
+    // the literal "__all") to true; .get(key, false) reads it safely
+    // whether or not that house has ever been granted anything.
+    function substitutionOpenFor(ev, houseId) {
+      let openFor = ev.substitutionOpenFor;
+      return openFor != null
+        && (openFor.get("__all", false) == true || openFor.get(houseId, false) == true);
+    }
+
+    // v9 — event material: a song title, a prop list, whatever an event's
+    // materialLabel asks for. Same shape as substitutions on purpose — a
+    // House submits, staff decides, and a House cannot edit a submission
+    // once it is in the queue.
+    //
+    // A Judge is NOT given read access here. An approved title is copied
+    // into judgingEntries instead (see writeJudgingEntries), the one
+    // document a judge actually reads — the same indirection description
+    // and blind judging both rely on, so material text can never carry a
+    // house's identity along with it by accident.
+    //
+    // Stage CAN read: assigning code letters rewrites judgingEntries,
+    // which now carries the material text, and a Stage Manager relettering
+    // after an Admin approved a submission must not silently blank it out.
+    match /eventMaterials/{id} {
+      allow read: if isStaff() || isStage()
+                  || (isHouse() && resource.data.houseId == refId());
+
+      allow create: if isStaff()
+                    || (isHouse()
+                        && request.resource.data.houseId == refId()
+                        && request.resource.data.status == "pending"
+                        && request.resource.data.title is string
+                        && request.resource.data.title.size() > 0
+                        // exists() FIRST — same reason as substitutions
+                        // above: a stale eventId must refuse cleanly.
+                        && exists(/databases/$(database)/documents/events/$(request.resource.data.eventId))
+                        && materialWindowOpen(eventDoc(request.resource.data.eventId)));
+
+      allow update, delete: if isStaff();
+    }
+    // v9 — an optional start/end on top of materialsEnabled. Unlike the
+    // registration window there is no fest-wide fallback: blank on either
+    // side means unbounded on that side, not "use the fest default",
+    // because there is no sensible fest-wide default for "song title
+    // deadline" the way there is for registration itself.
+    function materialWindowOpen(ev) {
+      return ev.materialsEnabled == true
+        && (ev.materialWindowStart == null || request.time >= timestampOf(ev.materialWindowStart))
+        && (ev.materialWindowEnd == null   || request.time <= timestampOf(ev.materialWindowEnd));
+    }
+
+    /* v9 — house contact details.
+     *
+     * A SEPARATE COLLECTION, and that is the whole point. `houses` is
+     * publicly readable, and Firestore rules are document-level: there is
+     * no way to expose a house's name and hide a phone number on the same
+     * document. Many of these numbers belong to students, so they live
+     * here, staff-only, and reach the public solely through the
+     * publicContacts snapshot — which carries only the numbers an Admin
+     * explicitly ticked.
+     *
+     * A House Manager can read their own house's record so they can see
+     * and check the numbers held for them.
+     */
+    match /houseContacts/{houseId} {
+      allow read: if isStaff() || (isHouse() && houseId == refId());
+      allow write: if isAdmin();
+    }
+
+    // Only the ticked-public entries, rebuilt from houseContacts.
+    match /publicContacts/{docId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    /* v9 — score overrides. Admin-only, and frozen once the event's
+     * result is published, on exactly the same condition as `scores` and
+     * `entryFlags`: all three move points, so all three lock together.
+     * Without the publish check an Admin could change a mark the public had
+     * already seen, which is the hole I14 closed for scores. */
+    match /scoreOverrides/{id} {
+      allow read: if isStaff();
+      allow write: if isAdmin()
+                   && !resultLocked(request.method == "delete"
+                        ? resource.data.eventId
+                        : request.resource.data.eventId);
+    }
+
+    /* v9 — mutual-exclusion constraint groups. Publicly readable
+     * because a House Manager's registration path evaluates them, and
+     * they describe rules rather than anybody's data. */
+    match /constraintGroups/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // v9 — manual point adjustments (discipline, bonuses, corrections).
+    // Admin-only to WRITE: moving a house total by hand is the single most
+    // consequential non-publish act in the app, and a Co-Admin who can score
+    // but not publish should not be able to do it either. Publicly readable
+    // because the totals they feed are public, and a deduction the affected
+    // house cannot see is one it cannot query.
+    match /adjustments/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // v9 — appeals against a published result.
+    //
+    // judgeUids is denormalised onto the appeal at filing time so a Judge
+    // can find their own with a single array-contains query. A list query
+    // gated by a get() per document is what failed once already for
+    // substitutions: Firestore cannot statically prove a per-document rule
+    // holds for every row in an unfiltered query, and rejects the whole
+    // list rather than guess.
+    //
+    // Deciding is Admin-or-Co-Admin, once, and only away from "pending" —
+    // an appeal cannot be reopened, the same finality Publish itself has.
+    // The decision never touches score data on its own; a House that wins
+    // an appeal has its result corrected separately through Score Override
+    // or Adjustments, so this collection can never contradict the scoring
+    // model it is judging.
+    match /appeals/{id} {
+      allow read: if isStaff()
+                  || (isHouse() && resource.data.houseId == refId())
+                  || (isJudge() && request.auth.uid in resource.data.judgeUids);
+
+      allow create: if isHouse()
+                    && request.resource.data.houseId == refId()
+                    && request.resource.data.status == "pending"
+                    && request.resource.data.feeScreenshot is string
+                    && request.resource.data.feeScreenshot.size() > 0
+                    && settings().appealsEnabled == true
+                    && appealWindowOpen(request.resource.data.eventId);
+
+      allow update: if isStaff()
+                    && resource.data.status == "pending"
+                    && (request.resource.data.status == "upheld"
+                        || request.resource.data.status == "overturned")
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(["status", "decision", "decidedBy", "decidedAt", "refundScreenshot"]);
+
+      allow delete: if isAdmin();
+    }
+
+    // v9 — titles. Hand-awarded, not tied to a scored event, so they carry
+    // no publish gate of their own — an Admin decides when to award one and
+    // that decision is immediately what the public sees.
+    match /titles/{id} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    // v8 — custom leaderboard definitions. Publicly readable because the
+    // public results page needs the names of the boards it renders; the
+    // tallies themselves live in the snapshot, not here.
+    match /leaderboards/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // v8 — Type and Tier vocabularies. Public, same as categories: they are
+    // filter values that appear on public listings.
+    match /programTypes/{id} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+    match /programTiers/{id} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    /* v9 — a House Manager may add participants to their OWN house, and
+     * only while the Admin has opened that window.
+     *
+     * Every clause is load-bearing: without the houseId check a manager
+     * could add people to a rival house, and without the window check the
+     * roster could be grown after code letters were drawn. eventCounts must
+     * start empty so a new participant cannot arrive pre-loaded with
+     * entries that never went through the cap transaction. */
+    function houseAddOpen() {
+      let s = settings();
+      return s.houseAddParticipants == true
+        && (s.houseAddWindow == null
+            || ((s.houseAddWindow.start == null || request.time >= timestamp.value(s.houseAddWindow.start))
+             && (s.houseAddWindow.end == null   || request.time <= timestamp.value(s.houseAddWindow.end))));
+    }
+
+    // ── Participants ─────────────────────────────────────────────────
+    // Publicly readable because the lookup page searches them by chest
+    // number and name. Only staff may create or edit.
+    //
+    // The one exception: a House Manager registering an entry has to bump
+    // that participant's event counters. They may change eventCounts and
+    // nothing else, and the overall maximum is checked here as well as in
+    // the app, so a hand-crafted write cannot exceed it.
+    match /participants/{pid} {
+      allow read: if true;
+      allow create: if isStaff()
+                    || (isHouse()
+                        && houseAddOpen()
+                        && request.resource.data.houseId == refId()
+                        // A new participant starts with nothing entered. Any
+                        // other starting value would be entries that never
+                        // passed through the cap transaction.
+                        && request.resource.data.eventCounts.overall == 0);
+      allow delete: if isStaff();
+      /* The `overall` cap is the server-side BACKSTOP, not the whole cap
+       * system. All nine tiers — overall, the four roll-ups and the four
+       * classes with their stage splits — are enforced inside the
+       * registration transaction in domain/registration.js, which is where
+       * they can be checked atomically against the entry tally.
+       *
+       * Only `overall` is re-checked here, deliberately: every extra tier
+       * would mean more get() calls against the rules' budget and more
+       * ways for a legitimate write to be refused by a rule that
+       * disagreed subtly with the transaction. `overall` is the cap that
+       * bounds all the others, so a hand-crafted write still cannot
+       * inflate a participant without limit. */
+      allow update: if isStaff()
+                    || (isHouse()
+                        && resource.data.houseId == refId()
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["eventCounts"])
+                        && (limits().overallMax == null
+                            || request.resource.data.eventCounts.overall <= limits().overallMax))
+                    // I9 — a House Manager may correct their own participant's
+                    // details (not move them to another house, and not the
+                    // chest number — that stays auto-allocated), gated on the
+                    // same add window as creating one: editing "who is in my
+                    // house" is the same act as adding them, on the same
+                    // clock.
+                    || (isHouse()
+                        && resource.data.houseId == refId()
+                        && houseAddOpen()
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly(["name", "nameLower", "categoryId", "categoryName", "className", "dob",
+                                       "gender", "photoData", "photoURL", "photoSource",
+                                       "photoOriginalLink", "photoLinkUnverified"]));
+    }
+
+    // Per-house entry tally, one document per (event, house).
+    //
+    // This exists because the Web SDK cannot run a query inside a
+    // transaction, so the per-house entry cap and the duplicate-participant
+    // check could not otherwise be made atomic. It is written in the same
+    // transaction as the registration it counts.
+    match /entryCounts/{tallyId} {
+      allow read: if isStaff() || isHouse() || isJudge();
+      allow write: if isStaff()
+                   || (isHouse()
+                       && request.resource.data.houseId == refId()
+                       && (!exists(/databases/$(database)/documents/events/$(request.resource.data.eventId))
+                           || eventDoc(request.resource.data.eventId).maxEntriesPerHouse == null
+                           || request.resource.data.count <= eventDoc(request.resource.data.eventId).maxEntriesPerHouse));
+    }
+
+    // ── Registrations ────────────────────────────────────────────────
+    // NOT public: an entry names the participants behind a code letter, so
+    // exposing it would defeat blind judging. Judges never read this.
+    match /registrations/{regId} {
+      // A Stage Manager reads everything: they have to call the right people
+      // to the stage, so the names behind a code letter are exactly what they
+      // need. Blind judging is not weakened by this — it is enforced against
+      // JUDGES, through judgingEntries, and a Stage Manager cannot score.
+      allow read: if isStaff() || isStage() || (isHouse() && resource.data.houseId == refId());
+
+      allow create: if isStaff()
+                    || (isHouse()
+                        && request.resource.data.houseId == refId()
+                        && request.resource.data.codeLetter == ""
+                        // I9 — a House Manager approving a staff-made request
+                        // creates this exact document as their own act. The
+                        // window may already be closed (that is often WHY an
+                        // Admin stepped in), so approving a genuine pending
+                        // request of theirs is the one other door in, besides
+                        // the window being open.
+                        && (registrationOpen(request.resource.data.eventId)
+                            || approvingOwnRequest(regId, request.resource.data)));
+
+      // A House Manager may withdraw only before code letters are assigned.
+      allow delete: if isStaff()
+                    || (isHouse() && resource.data.houseId == refId() && resource.data.codeLetter == "");
+
+      // A Stage Manager may letter an entry and nothing else. Restricting the
+      // affected keys is what keeps that true: without hasOnly, "may update"
+      // would mean they could move an entry to another house or swap its
+      // participants, which is a far larger power than assigning a letter.
+      //
+      // A letter change is refused once the event is LOCKED (finalized or
+      // published) — full stop, no letter of any kind moves after that.
+      // Before that, once scoringStarted() (the first mark a judge saves),
+      // REASSIGNING an already-lettered entry is refused, but giving a
+      // first letter to an entry that has none yet is still allowed. That
+      // split matters: an entry can register after judging is underway (a
+      // late approval, an on-behalf registration), and with no letter it
+      // can never be scored or marked Absent — Finalize would then refuse
+      // forever on an entry nobody can ever satisfy. A mark's document id
+      // is {eventId}_{regId}_{judgeUid} and stores regId, so re-lettering
+      // never technically detaches a mark from the entry that earned it —
+      // that was true even before this existed. But the fest asked for a
+      // hard stop on REASSIGNING anyway: once a judge has a code letter in
+      // front of them, shuffling it out from under them is a live risk,
+      // not just a stale printed sheet, and a warning in the UI was not
+      // enough to stop it actually happening. Handing a letter to someone
+      // who never had one carries none of that risk — no judge has seen
+      // the old value, because there wasn't one. Admin/Co-Admin can still
+      // lift the reassignment freeze if a genuine emergency needs it —
+      // they hold unconditional write on judgingEntries below and can flip
+      // scoringStarted back to false there, before Unfinalize is otherwise
+      // available.
+      //
+      // Every OTHER update to a registration (a substitution's roster swap,
+      // and the like) is untouched: the check only fires when codeLetter
+      // itself is part of what changed.
+      allow update: if (isStaff()
+                        && (!codeLetterChanged(resource.data, request.resource.data)
+                            || codeLetterWriteAllowed(resource.data, request.resource.data)))
+                    || (isStage()
+                        && codeLetterWriteAllowed(resource.data, request.resource.data)
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly(["codeLetter", "codeLetterAssignedBy", "codeLetterAssignedAt"]));
+    }
+
+    function codeLetterChanged(before, after) {
+      return before.codeLetter != after.codeLetter;
+    }
+    // A letter can always be given to an entry that has none (before ==
+    // ""), even mid-judging — see the comment above. Reassigning one that
+    // already has a value is refused once scoring has started, same as an
+    // outright no-op (before == after) is always fine. Either way, nothing
+    // moves once the event is locked.
+    function codeLetterWriteAllowed(before, after) {
+      return !resultLocked(before.eventId)
+          && (before.codeLetter == after.codeLetter
+              || before.codeLetter == ""
+              || !scoringStarted(before.eventId));
+    }
+    // Sibling to resultLocked(), but fires earlier: the first mark a judge
+    // or Admin saves, well before Finalize. Set on judgingEntries because
+    // that document already exists by the time anyone can score at all.
+    function scoringStarted(eventId) {
+      return exists(/databases/$(database)/documents/judgingEntries/$(eventId))
+          && get(/databases/$(database)/documents/judgingEntries/$(eventId)).data.scoringStarted == true;
+    }
+
+    // I9 — the new registrations doc is deliberately given the SAME Firestore
+    // doc id as the registrationRequests doc it fulfils (see
+    // domain/registrationRequests.js), so this rule can look the request up
+    // directly by id — a query is not possible inside a rule, only get().
+    function approvingOwnRequest(regId, data) {
+      return exists(/databases/$(database)/documents/registrationRequests/$(regId))
+          && get(/databases/$(database)/documents/registrationRequests/$(regId)).data.houseId == data.houseId
+          && get(/databases/$(database)/documents/registrationRequests/$(regId)).data.eventId == data.eventId
+          && get(/databases/$(database)/documents/registrationRequests/$(regId)).data.status == "pending";
+    }
+
+    // I9 — Admin/Co-Admin registering on a house's behalf, gated per role by
+    // a Settings toggle. Mirrors /substitutions with requester and decider
+    // swapped: staff REQUESTS (create, pending only), the House DECIDES
+    // (update to approved/rejected). Staff cannot update a pending request's
+    // status at all — that is what makes "if the House rejects, an Admin
+    // cannot force it through" a rule rather than a UI convention.
+    match /registrationRequests/{regId} {
+      allow read: if isStaff() || (isHouse() && resource.data.houseId == refId());
+
+      allow create: if request.resource.data.status == "pending"
+                    // exists() FIRST — a stale eventId or houseId must read
+                    // as a clean refusal, not a rules EVALUATION ERROR.
+                    && exists(/databases/$(database)/documents/events/$(request.resource.data.eventId))
+                    && exists(/databases/$(database)/documents/houses/$(request.resource.data.houseId))
+                    && ((isAdmin() && settings().allowAdminRegisterForHouse == true)
+                        || (isCoAdmin() && settings().allowCoAdminRegisterForHouse == true));
+
+      allow update: if isHouse()
+                    && resource.data.houseId == refId()
+                    && resource.data.status == "pending"
+                    && request.resource.data.status in ["approved", "rejected"]
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(["status", "decidedBy", "decidedAt", "reason"]);
+
+      allow delete: if isStaff();
+    }
+
+    // Consent for the PERMISSION to register on a house's behalf, as opposed
+    // to consent for one entry (above). Staff asks, the House Manager
+    // answers once, and staff may then register for that house directly.
+    // Staff can ask and can clear the question, but must never be able to
+    // answer it: the status transition is a House-only write, the same
+    // boundary registrationRequests draws, so "an Admin cannot approve on
+    // the house's behalf" is enforced here rather than in the UI.
+    match /onBehalfConsents/{consentId} {
+      allow read: if isStaff() || (isHouse() && resource.data.houseId == refId());
+
+      allow create: if isStaff()
+                    && request.resource.data.status == "pending"
+                    && exists(/databases/$(database)/documents/houses/$(request.resource.data.houseId));
+
+      // Staff re-asking resets a decided row back to pending; it can never
+      // set approved/rejected itself.
+      allow update: if (isStaff()
+                        && request.resource.data.status == "pending")
+                    || (isHouse()
+                        && resource.data.houseId == refId()
+                        && request.resource.data.status in ["approved", "rejected"]
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly(["status", "decidedBy", "decidedAt"]));
+
+      allow delete: if isStaff();
+    }
+
+    function registrationOpen(eventId) {
+      return eventWindowOpen(eventDoc(eventId));
+    }
+    function eventWindowOpen(ev) {
+      return (
+        (ev.registrationStart == null
+          ? (settings().registrationWindow.start == null
+             || request.time >= timestampOf(settings().registrationWindow.start))
+          : request.time >= timestampOf(ev.registrationStart))
+      ) && (
+        (ev.registrationEnd == null
+          ? (settings().registrationWindow.end == null
+             || request.time <= timestampOf(settings().registrationWindow.end))
+          : request.time <= timestampOf(ev.registrationEnd))
+      );
+    }
+    // Windows are stored as epoch milliseconds so they survive JSON export.
+    function timestampOf(ms) {
+      return timestamp.value(ms);
+    }
+
+    // ── Judging ──────────────────────────────────────────────────────
+    // A judge's view of an event. For a blind event this document contains
+    // code letters only — the names are not merely hidden in the interface,
+    // they are never written here in the first place.
+    match /judgingEntries/{eventId} {
+      allow read: if isStaff() || (isJudge() && assignedToEvent(eventId));
+      // A Stage Manager writes this only as the second half of lettering —
+      // judgingEntries is rebuilt from the registrations, so letters that
+      // never reached it would leave judges with nothing to score. Frozen
+      // the moment scoring starts, same as the registrations.codeLetter
+      // rule this exists alongside — re-lettering after that would rebuild
+      // this doc's entries too and detach real marks from their entry.
+      //
+      // A judge is otherwise never granted write on this collection at
+      // all (see the read rule above) — this ONE field is the sole
+      // exception, letting the first score they save flip
+      // scoringStarted so the codeLetter lock above can see it.
+      allow write: if isStaff() || (isStage() && !resultLocked(eventId) && !scoringStarted(eventId))
+                   || (isJudge() && assignedToEvent(eventId)
+                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["scoringStarted"])
+                       && request.resource.data.scoringStarted == true);
+    }
+
+    // Who has actually gone on stage. Deliberately NOT a field on the
+    // registration and deliberately not entryFlags: this is a running-order
+    // aid, and an absence moves points. Keeping them in separate collections
+    // means no rule change here can ever be mistaken for the power to mark
+    // somebody absent.
+    match /stageArrivals/{id} {
+      allow read:  if isStaff() || isStage();
+      allow write: if isStaff() || isStage();
+    }
+
+    match /judgeAssignments/{id} {
+      // v9 — also House. Filing an appeal denormalises which judges are
+      // assigned onto the appeal itself (see /appeals below), which means
+      // reading this collection by eventId at that moment. Who is judging
+      // an event is not the thing blind judging protects — that is
+      // participant identity, kept out of judgingEntries — so this is a
+      // minor exposure, not a fairness hole.
+      allow read: if isStaff() || isHouse()
+                  || (isJudge() && resource.data.judgeUid == request.auth.uid);
+      // Adding or removing a judge once a result exists changes who "owns"
+      // marks that have already been computed into a ranking — the same
+      // freeze scores/entryFlags/codeLetter already get. Unfinalize first.
+      allow write: if isStaff()
+                   && !resultLocked(request.method == "delete" ? resource.data.eventId : request.resource.data.eventId);
+    }
+
+    // Judging is Admin-only among staff: a Co-Admin can see scores but not
+    // enter or correct them.
+    match /scores/{scoreId} {
+      allow read: if isStaff() || (isJudge() && resource.data.judgeUid == request.auth.uid);
+
+      // A judge may write only their own score, only for an event they are
+      // assigned to, and only a number inside the fest's score scale.
+      //
+      // Admin may CREATE any judge's score freely — filling in for one who
+      // has not scored yet. Admin may not, however, UPDATE a mark that a
+      // judge actually submitted themselves: that would let a real judge's
+      // number be silently replaced, which is the one thing this rule
+      // exists to stop. enteredByAdminOverride is the marker that tells the
+      // two apart — admin.js sets it true on every write it makes,
+      // judge.js sets it false on every write it makes (never left to a
+      // merge to preserve), so it always reflects who last actually
+      // entered the number, admin-filled or judge-submitted alike. An
+      // update that touches ONLY `excluded` is let through regardless —
+      // that is the separate Freeze feature, which corrects a mark by
+      // excluding it from the average without changing the number itself,
+      // and must keep working on a genuine judge score.
+      allow create: if !resultLocked(request.resource.data.eventId)
+                    && (isAdmin() || judgeOwnScore(request.resource.data));
+
+      allow update: if !resultLocked(request.resource.data.eventId)
+                    && ((isAdmin()
+                          && (resource.data.enteredByAdminOverride == true
+                              || request.resource.data.diff(resource.data).affectedKeys().hasOnly(["excluded"])))
+                        || judgeOwnScore(request.resource.data));
+
+      // Delete follows the same line as update: deleting a judge's own
+      // submitted mark is just overwriting it with nothing, and would
+      // otherwise let a delete-then-recreate round trip through the
+      // unconditional create rule above defeat the whole point of it.
+      allow delete: if !resultLocked(resource.data.eventId)
+                    && ((isAdmin() && resource.data.enteredByAdminOverride == true)
+                        || (isJudge() && resource.data.judgeUid == request.auth.uid));
+    }
+
+    function judgeOwnScore(data) {
+      return isJudge()
+          && data.judgeUid == request.auth.uid
+          && assignedToEvent(data.eventId)
+          && data.score is number
+          && data.score >= 0
+          && data.score <= settings().scoreScale;
+    }
+
+    // I20 — a judge's one-per-event "how did this go" note, separate from
+    // any individual entry's score so it survives an Unfinalize/re-score and
+    // is never mistaken for something that moves points. Admin/Co-Admin see
+    // it; a House or a participant never can, matching what the fest asked
+    // for. Not gated on resultLocked() — a judge writes this once they are
+    // DONE judging, which is often exactly when the event gets finalized.
+    match /judgeEventNotes/{id} {
+      allow read: if isStaff() || (isJudge() && resource.data.judgeUid == request.auth.uid);
+      allow create, update: if isStaff()
+                            || (isJudge()
+                                && request.resource.data.judgeUid == request.auth.uid
+                                && assignedToEvent(request.resource.data.eventId));
+      allow delete: if isStaff() || (isJudge() && resource.data.judgeUid == request.auth.uid);
+    }
+
+    // Absence is its own document rather than a field on the registration,
+    // so a judge can mark it without being able to read or alter the entry.
+    match /entryFlags/{flagId} {
+      allow read: if isStaff() || isJudge();
+
+      // An absence flag moves points exactly as much as a score does, so it
+      // is frozen on the same condition.
+      allow write: if !resultLocked(
+                        request.method == "delete" ? resource.data.eventId : request.resource.data.eventId)
+                   && (isStaff()
+                       || (isJudge() && assignedToEvent(
+                            request.method == "delete" ? resource.data.eventId : request.resource.data.eventId)));
+    }
+
+    // ── Results ──────────────────────────────────────────────────────
+    // Staff-only. The public never reads this collection; it reads the
+    // publicResults snapshots instead.
+    //
+    // This is where Publish is enforced as Admin-only: a Co-Admin may
+    // create, finalize and stage, but any write that sets publishStatus to
+    // "Published" is rejected unless the caller is an Admin.
+    match /results/{eventId} {
+      allow read: if isStaff();
+      allow create: if isStaff() && request.resource.data.publishStatus != "Published";
+      allow update: if isStaff()
+                    && (isAdmin() || request.resource.data.publishStatus != "Published");
+      // I22 — Unfinalize deletes this doc outright. Refusing the delete on
+      // a Published result forces the real order of operations: Unpublish
+      // on the Results screen first (a Co-Admin can do that far end too),
+      // THEN Unfinalize — never a Published result vanishing in one step
+      // with the public snapshot left pointing at nothing.
+      allow delete: if isAdmin() && resource.data.publishStatus != "Published";
+    }
+
+    // ── Public snapshots ─────────────────────────────────────────────
+    // Everything the public sees, pre-built. Small, cheap to read, and the
+    // only collections a signed-out visitor ever touches.
+    match /publicResults/{eventId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+    match /publicLeaderboard/{docId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+    match /publicSchedule/{docId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+    // Written by staff on publish, and by a House Manager when they
+    // register one of their own participants.
+    match /participantPublic/{pid} {
+      allow read: if true;
+      allow write: if isStaff() || isHouse();
+    }
+
+    // Saved certificate and poster designs. Readable by staff only — they
+    // are working documents, not public content.
+    match /designs/{designId} {
+      allow read: if isStaff();
+      allow write: if isStaff();
+    }
+
+    match /logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if signedIn();
+      allow update, delete: if false;
+    }
+
+    // v9 — messaging. Admin-toggleable and off by default; a House,
+    // Judge or Stage Manager account can neither find nor be found by one
+    // until an Admin or Co-Admin actually starts a conversation with them,
+    // and even then only the participants of THAT conversation can read it.
+    //
+    // Only staff creates a conversation ("admin initiates"). Once it
+    // exists, any participant may send a message and update the
+    // lastMessage* preview — that preview is what makes the conversation
+    // LIST need no extra read of anyone's messages subcollection.
+    match /conversations/{id} {
+      allow read: if isStaff()
+                  || (signedIn() && request.auth.uid in resource.data.participantUids);
+
+      allow create: if isStaff()
+                    && settings().messagingEnabled == true
+                    && request.auth.uid in request.resource.data.participantUids
+                    && request.resource.data.participantUids.size() >= 2;
+
+      // Participants may only ever touch the preview fields — everything
+      // else about a conversation (who is in it, its name, its type) is
+      // fixed at creation. Widening membership after the fact is a new
+      // conversation in this design, not an edit to an old one.
+      allow update: if (isStaff() || (signedIn() && request.auth.uid in resource.data.participantUids))
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(["lastMessageAt", "lastMessageText", "lastMessageBy"]);
+
+      allow delete: if isAdmin();
+
+      match /messages/{msgId} {
+        allow read: if isStaff() || (signedIn() && inConversation(id));
+        // A message cannot be edited or withdrawn once sent — the same
+        // finality a printed sheet has. senderUid must be the caller's own,
+        // so nobody can post as someone else in a chat they belong to.
+        // signedIn() alone — isStaff() implied, and membership is what
+        // actually gates this. inConversation() is the real check.
+        allow create: if signedIn()
+                      && inConversation(id)
+                      && request.resource.data.senderUid == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+    function inConversation(convId) {
+      return request.auth.uid in
+        get(/databases/$(database)/documents/conversations/$(convId)).data.participantUids;
+    }
+
+    // Anything not named above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
